@@ -1,0 +1,8 @@
+What departments are in this hospital?
+Who works in Cardiology?
+When is Dr. Tariq available?
+I need a pediatrician
+Where is Dr. Al-Farsi?
+Cardiology
+Heart Attack
+exit

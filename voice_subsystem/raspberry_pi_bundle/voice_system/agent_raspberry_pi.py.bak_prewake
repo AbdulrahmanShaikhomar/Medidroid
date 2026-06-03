@@ -1,0 +1,1324 @@
+import argparse
+import asyncio
+import audioop
+import json
+import os
+import re
+import shutil
+import string
+import subprocess
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+import wave
+from difflib import SequenceMatcher
+from pathlib import Path
+
+import edge_tts
+import speech_recognition as sr
+from faster_whisper import WhisperModel
+
+# --- Configuration ---
+BASE_DIR = Path(__file__).resolve().parent
+DATABASE_FILE = BASE_DIR / "hospital_db.json"
+VOICE_NAME = "en-US-AriaNeural"
+WAKE_WORD_PATTERNS = ["hey medidroid", "medidroid", "midi droid", "medi droid"]
+GENERIC_MEDICAL_WORDS = {"doctor", "dr", "physician", "care"}
+TARGET_SAMPLE_RATE = 16000
+CAPTURE_SAMPLE_RATE = 44100
+CHANNELS = 1
+SAMPLE_WIDTH = 2
+WAKE_RECORD_SECONDS = 4
+COMMAND_RECORD_SECONDS = 4
+PRE_ROLL_SECONDS = 0.25
+SILENCE_TRANSCRIPT = "(skipped transcription: mostly silence)"
+USB_SPEAKER_VOLUME_PERCENT = "80%"
+USB_TTS_GAIN = "1.8"
+BEEP_FREQUENCY_HZ = 1100
+BEEP_DURATION_MS = 140
+BEEP_VOLUME = 0.35
+SPEED_PROFILES = {
+    "fastest": {
+        "spoken_label": "fast",
+        "pwm": 255,
+        "linear_speed_mps": 0.50,
+        "aliases": ["fastest", "fast", "maximum", "max", "quickest", "quick", "full speed"],
+    },
+    "normal": {
+        "spoken_label": "medium",
+        "pwm": 170,
+        "linear_speed_mps": round(170 / 510.0, 3),
+        "aliases": ["normal", "medium", "regular", "standard", "default", "middle", "steady"],
+    },
+    "slow": {
+        "spoken_label": "easy",
+        "pwm": 85,
+        "linear_speed_mps": round(85 / 510.0, 3),
+        "aliases": ["slow", "slower", "safest", "careful", "gently", "easy", "gentle", "safe"],
+    },
+}
+DEFAULT_SPEED_PROFILE = "normal"
+
+# --- Navigation bridge: webdrive.py record/replay route server (http on the Pi) ---
+WEBDRIVE_URL = os.environ.get("WEBDRIVE_URL", "http://127.0.0.1:8080")
+# 'full' = drive there -> turn -> drive BACK to start, so the robot always ends at
+# its initial position. The mic stays locked for the whole run (see
+# wait_for_navigation_complete) and only re-arms once the robot is back home.
+NAV_ROUTE_MODE = os.environ.get("NAV_ROUTE_MODE", "full")  # webdrive replay mode: there | back | full
+NAV_RUN_START_TIMEOUT = 12.0   # seconds to wait for the replay to actually start (mode -> replay)
+NAV_RUN_MAX_SECONDS = 300.0    # hard cap on how long we block waiting for a run to finish
+ROUTE_MAP_FILE = BASE_DIR / "route_map.json"  # optional override: {"101": "roomA", "cardiology": "roomA", ...}
+# Default mapping from a hospital_db destination key (room number or department
+# name, lowercased) to a recorded webdrive route name. Editable via route_map.json.
+DEFAULT_ROUTE_MAP = {
+    "101": "roomA",
+    "205": "roomB",
+    "301": "roomC",
+    "cardiology": "roomA",
+    "neurology": "roomB",
+    "pediatrics": "roomC",
+}
+
+
+def compute_audio_levels(frames, sample_width=SAMPLE_WIDTH):
+    if not frames:
+        return 0.0, 0.0
+
+    rms = audioop.rms(frames, sample_width)
+    peak_min, peak_max = audioop.minmax(frames, sample_width)
+    peak = max(abs(peak_min), abs(peak_max))
+    max_pcm = float((2 ** (8 * sample_width - 1)) - 1)
+
+    rms_pct = (rms / max_pcm) * 100.0
+    peak_pct = (peak / max_pcm) * 100.0
+    return round(rms_pct, 2), round(peak_pct, 2)
+
+
+def classify_signal(rms_pct, peak_pct):
+    if rms_pct < 1.0 and peak_pct < 3.0:
+        return "Mostly silence"
+    if rms_pct < 5.0 and peak_pct < 12.0:
+        return "Weak signal detected"
+    return "Clear signal detected"
+
+
+def normalize_text(text):
+    return re.sub(r"[^a-z0-9 ]+", "", text.lower()).strip()
+
+
+def tokenize_name_parts(text):
+    return [
+        token
+        for token in re.findall(r"\b[a-z0-9]+\b", text.lower())
+        if token not in {"dr", "doctor"} and len(token) >= 3
+    ]
+
+
+def extract_meaningful_command_tokens(text):
+    ignored_tokens = {
+        "a",
+        "an",
+        "at",
+        "can",
+        "department",
+        "doctor",
+        "dr",
+        "find",
+        "for",
+        "get",
+        "help",
+        "i",
+        "in",
+        "is",
+        "locate",
+        "looking",
+        "me",
+        "need",
+        "of",
+        "physician",
+        "please",
+        "schedule",
+        "see",
+        "show",
+        "the",
+        "to",
+        "where",
+        "who",
+    }
+    return [
+        token
+        for token in re.findall(r"\b[a-z0-9]+\b", text.lower())
+        if token not in ignored_tokens and len(token) >= 3
+    ]
+
+
+def resolve_capture_device(mic_index):
+    names = sr.Microphone.list_microphone_names()
+    if mic_index is None or mic_index < 0 or mic_index >= len(names):
+        return "default"
+
+    name = names[mic_index]
+    if "(hw:" in name:
+        hw = name.split("(hw:", 1)[1].split(")", 1)[0]
+        return f"plughw:{hw}"
+
+    return "default"
+
+
+def resolve_usb_playback_device():
+    try:
+        result = subprocess.run(
+            ["aplay", "-l"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    for line in result.stdout.splitlines():
+        if "device" not in line:
+            continue
+        if "USB" in line or "UAC" in line:
+            card_match = re.search(r"card\s+(\d+):", line)
+            device_match = re.search(r"device\s+(\d+):", line)
+            if card_match and device_match:
+                return f"plughw:{card_match.group(1)},{device_match.group(1)}"
+
+    return None
+
+
+def extract_card_index(playback_device):
+    if not playback_device:
+        return None
+    match = re.match(r"plughw:(\d+),(\d+)", playback_device)
+    if match:
+        return match.group(1)
+    return None
+
+
+class RaspberryPiVoiceAgent:
+    def __init__(
+        self,
+        enable_audio=True,
+        enable_whisper=True,
+        auto_greet=True,
+        scripted_inputs=None,
+        mic_index=None,
+        stt_model="tiny.en",
+        nav_dry_run=False,
+    ):
+        self.enable_audio = enable_audio
+        self.enable_whisper = enable_whisper
+        self.scripted_inputs = list(scripted_inputs or [])
+        self.mic_index = mic_index
+        self.stt_model_name = stt_model
+        self.nav_dry_run = nav_dry_run
+        self.route_map = self.load_route_map()
+        self._routes_cache = None
+        self._routes_cache_time = 0.0
+        self.whisper_model = None
+        self.pending_response_timer_start = None
+        self.pending_wake_timer_start = None
+        self.wake_word_armed = self.enable_whisper and not self.scripted_inputs
+        self.audio_player = self.detect_audio_player()
+        self.playback_device = resolve_usb_playback_device()
+        self.playback_card_index = extract_card_index(self.playback_device)
+        self.capture_device = resolve_capture_device(self.mic_index) if self.enable_whisper else "default"
+        self.prompt_beep_wav = BASE_DIR / "prompt_beep.wav"
+
+        if self.enable_audio and self.audio_player is None:
+            print("[AUDIO] No supported Linux audio player found. Responses will be printed but not played.")
+            self.enable_audio = False
+        elif self.enable_audio and self.playback_device:
+            print(f"[AUDIO] Using playback device: {self.playback_device}")
+
+        if self.enable_whisper:
+            print(f"\n[SYSTEM] Loading Local Whisper Model '{self.stt_model_name}' (This may take a moment on first boot)...")
+            self.whisper_model = WhisperModel(self.stt_model_name, device="cpu", compute_type="int8")
+
+        self.db = self.load_database()
+        self.command_prompt = self.build_command_prompt()
+        self.known_terms = self.build_known_terms()
+
+        self.recognizer = sr.Recognizer()
+        self.recognizer.energy_threshold = 4000
+        self.recognizer.dynamic_energy_threshold = True
+        self.recognizer.pause_threshold = 1.5
+
+        print("\n[SYSTEM] Raspberry Pi Voice Agent Initialized. Ready.")
+
+        if auto_greet and not self.wake_word_armed:
+            self.run_async_speak("System online. MediDroid at your service.")
+
+    def detect_audio_player(self):
+        candidates = [
+            ("ffplay", ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]),
+            ("mpg123", ["mpg123", "-q"]),
+            ("mpg321", ["mpg321", "-q"]),
+            ("cvlc", ["cvlc", "--play-and-exit", "--quiet"]),
+        ]
+        for binary, command in candidates:
+            if shutil.which(binary):
+                return command
+        return None
+
+    def load_database(self):
+        try:
+            with open(DATABASE_FILE, "r", encoding="utf-8") as db_file:
+                data = json.load(db_file)
+                print("[DB] Loaded department data.")
+                return data
+        except FileNotFoundError:
+            return {"departments": []}
+
+    def get_department_offices(self, dept):
+        return dept.get("offices", [])
+
+    def get_department_coordinates(self, dept):
+        if isinstance(dept.get("coordinates"), dict):
+            return dept["coordinates"]
+
+        offices = self.get_department_offices(dept)
+        if offices:
+            return offices[0]["coordinates"]
+
+        return {"x": 0.0, "y": 0.0}
+
+    def speak(self, text):
+        print(f"MediDroid: {text}")
+        if not self.enable_audio:
+            self.emit_wake_response_time_if_pending()
+            self.emit_response_time_if_pending()
+            return
+
+        temp_file = BASE_DIR / f"response_{int(time.time())}.mp3"
+        temp_wav = BASE_DIR / f"response_{int(time.time())}.wav"
+
+        async def _save_audio():
+            communicate = edge_tts.Communicate(text, VOICE_NAME)
+            await communicate.save(str(temp_file))
+
+        try:
+            self.emit_wake_response_time_if_pending()
+            asyncio.run(_save_audio())
+            self.emit_response_time_if_pending()
+            if self.playback_device and shutil.which("ffmpeg") and shutil.which("aplay"):
+                self.ensure_usb_playback_volume()
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(temp_file),
+                        "-filter:a",
+                        f"volume={USB_TTS_GAIN}",
+                        "-ac",
+                        "2",
+                        "-ar",
+                        "48000",
+                        "-f",
+                        "wav",
+                        str(temp_wav),
+                    ],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                subprocess.run(
+                    ["aplay", "-D", self.playback_device, str(temp_wav)],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.run(
+                    [*self.audio_player, str(temp_file)],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception as exc:
+            print(f"[!] Audio Error: {exc}")
+        finally:
+            try:
+                if temp_file.exists():
+                    temp_file.unlink()
+            except OSError:
+                pass
+            try:
+                if temp_wav.exists():
+                    temp_wav.unlink()
+            except OSError:
+                pass
+
+    def ensure_usb_playback_volume(self):
+        if not self.playback_card_index or not shutil.which("amixer"):
+            return
+
+        subprocess.run(
+            ["amixer", "-c", self.playback_card_index, "set", "PCM", USB_SPEAKER_VOLUME_PERCENT],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def run_async_speak(self, text):
+        self.speak(text)
+
+    def emit_wake_response_time_if_pending(self):
+        if self.pending_wake_timer_start is None:
+            return
+
+        elapsed = time.perf_counter() - self.pending_wake_timer_start
+        print(f"[PERFORMANCE] Wake response time: {elapsed:.2f} seconds")
+        self.pending_wake_timer_start = None
+
+    def emit_response_time_if_pending(self):
+        if self.pending_response_timer_start is None:
+            return
+
+        elapsed = time.perf_counter() - self.pending_response_timer_start
+        print(f"[PERFORMANCE] Response time: {elapsed:.2f} seconds")
+        self.pending_response_timer_start = None
+
+    def ensure_prompt_beep(self):
+        if self.prompt_beep_wav.exists():
+            return
+
+        import math
+
+        sample_rate = 16000
+        frame_count = int(sample_rate * (BEEP_DURATION_MS / 1000.0))
+        amplitude = int(((2 ** (8 * SAMPLE_WIDTH - 1)) - 1) * BEEP_VOLUME)
+
+        with wave.open(str(self.prompt_beep_wav), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(SAMPLE_WIDTH)
+            wav_file.setframerate(sample_rate)
+
+            frames = bytearray()
+            for index in range(frame_count):
+                sample = int(amplitude * math.sin(2 * math.pi * BEEP_FREQUENCY_HZ * index / sample_rate))
+                frames.extend(sample.to_bytes(2, byteorder="little", signed=True))
+            wav_file.writeframes(bytes(frames))
+
+    def play_prompt_beep(self):
+        if not self.enable_audio:
+            return
+
+        self.ensure_prompt_beep()
+        self.ensure_usb_playback_volume()
+
+        try:
+            if self.playback_device and shutil.which("aplay"):
+                subprocess.run(
+                    ["aplay", "-D", self.playback_device, str(self.prompt_beep_wav)],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            elif self.audio_player:
+                subprocess.run(
+                    [*self.audio_player, str(self.prompt_beep_wav)],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception:
+            pass
+
+    def is_exit_command(self, normalized_text):
+        return any(
+            word in normalized_text
+            for word in ["exit", "quit", "shut down", "shutdown", "stop", "step", "finish", "end"]
+        )
+
+    def get_next_scripted_input(self):
+        if self.scripted_inputs:
+            scripted = self.scripted_inputs.pop(0).strip().lower()
+            print(f"   [SCRIPTED INPUT] '{scripted}'")
+            return scripted
+        return None
+
+    def build_command_prompt(self):
+        phrases = []
+        seen = set()
+
+        def add_phrase(text):
+            clean = text.strip()
+            if not clean:
+                return
+            lowered = clean.lower()
+            if lowered in seen:
+                return
+            seen.add(lowered)
+            phrases.append(clean)
+
+        for dept in self.db.get("departments", []):
+            add_phrase(dept["name"])
+            for alias in dept.get("aliases", []):
+                add_phrase(alias)
+            for office in self.get_department_offices(dept):
+                doc = office["doctor"]
+                add_phrase(doc["full_name"])
+                add_phrase(doc["first"])
+                add_phrase(doc["family"])
+                for alias in doc.get("aliases", []):
+                    add_phrase(alias)
+
+        return ". ".join(phrases[:32]) + "."
+
+    def build_known_terms(self):
+        terms = set()
+
+        def add_term(text):
+            for part in re.findall(r"\b[a-zA-Z]{4,}\b", text.lower()):
+                if part not in GENERIC_MEDICAL_WORDS:
+                    terms.add(part)
+
+        for dept in self.db.get("departments", []):
+            add_term(dept["name"])
+            for alias in dept.get("aliases", []):
+                add_term(alias)
+            for office in self.get_department_offices(dept):
+                doc = office["doctor"]
+                add_term(doc["first"])
+                add_term(doc["family"])
+                add_term(doc["full_name"])
+                for alias in doc.get("aliases", []):
+                    add_term(alias)
+                for specialty in office.get("specialties", []):
+                    add_term(specialty)
+
+        return sorted(terms)
+
+    def apply_db_term_corrections(self, text):
+        words = re.findall(r"\b\w+\b", text.lower())
+        corrected = []
+
+        for word in words:
+            best_match = word
+            best_ratio = 0.0
+
+            for candidate in self.known_terms:
+                ratio = SequenceMatcher(None, word, candidate).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_match = candidate
+
+            if best_ratio >= 0.84 or (len(word) >= 6 and best_ratio >= 0.76):
+                corrected.append(best_match)
+            else:
+                corrected.append(word)
+
+        return " ".join(corrected)
+
+    def transcribe_wav_path(self, wav_path, context_prompt=None):
+        segments, _info = self.whisper_model.transcribe(
+            wav_path,
+            beam_size=5,
+            best_of=1,
+            temperature=0.0,
+            language="en",
+            vad_filter=True,
+            condition_on_previous_text=False,
+            initial_prompt=context_prompt,
+        )
+        raw_text = "".join(segment.text for segment in segments).strip().lower()
+        return raw_text.translate(str.maketrans("", "", string.punctuation))
+
+    def contains_wake_word(self, text):
+        if not text:
+            return False
+
+        normalized = normalize_text(text)
+        compact = normalized.replace(" ", "")
+
+        if any(pattern.replace(" ", "") in compact for pattern in WAKE_WORD_PATTERNS):
+            return True
+
+        fuzzy_candidates = [
+            "medidroid",
+            "medidroyd",
+            "medidyroid",
+            "mididroid",
+            "metethroid",
+            "meteorite",
+            "hamidintheright",
+            "handmadeitright",
+            "imwiththedroid",
+            "imgonnadrawit",
+            "medidrawit",
+            "mididrawit",
+            "midedroid",
+            "medidroit",
+        ]
+        if any(candidate in compact for candidate in fuzzy_candidates):
+            return True
+
+        words = normalized.split()
+        if normalized.startswith("hey ") and any(token.startswith(("d", "dr", "m", "mi", "me")) for token in words[1:]):
+            return True
+
+        windows = []
+        for size in (1, 2, 3, 4):
+            for idx in range(len(words) - size + 1):
+                windows.append("".join(words[idx : idx + size]))
+
+        targets = ["medidroid", "heymedidroid"]
+        for window in windows:
+            for target in targets:
+                if SequenceMatcher(None, window, target).ratio() >= 0.72:
+                    return True
+
+        return False
+
+    def capture_audio_clip(self, seconds, show_listening_label):
+        temp_path = None
+        converted_temp_path = None
+        try:
+            if show_listening_label:
+                print("\n" + "=" * 30)
+                mic_label = f"Mic Index {self.mic_index}" if self.mic_index is not None else "Default Mic"
+                print(f"   LISTENING ({mic_label}) ...")
+                print("=" * 30)
+            else:
+                print("\n" + "=" * 30)
+                mic_label = f"Mic Index {self.mic_index}" if self.mic_index is not None else "Default Mic"
+                print(f"   WAITING FOR WAKE WORD ({mic_label}) ...")
+                print("=" * 30)
+
+            if show_listening_label:
+                self.play_prompt_beep()
+            time.sleep(PRE_ROLL_SECONDS)
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+                temp_path = temp_file.name
+
+            subprocess.run(
+                [
+                    "arecord",
+                    "-D",
+                    self.capture_device,
+                    "-f",
+                    "S16_LE",
+                    "-r",
+                    str(CAPTURE_SAMPLE_RATE),
+                    "-c",
+                    str(CHANNELS),
+                    "-d",
+                    str(seconds),
+                    temp_path,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            with wave.open(temp_path, "rb") as wav_file:
+                raw_frames = wav_file.readframes(wav_file.getnframes())
+
+            converted_frames = audioop.ratecv(
+                raw_frames,
+                SAMPLE_WIDTH,
+                CHANNELS,
+                CAPTURE_SAMPLE_RATE,
+                TARGET_SAMPLE_RATE,
+                None,
+            )[0]
+
+            rms_pct, peak_pct = compute_audio_levels(converted_frames, SAMPLE_WIDTH)
+            signal_state = classify_signal(rms_pct, peak_pct)
+
+            if signal_state == "Mostly silence":
+                return {
+                    "signal_state": signal_state,
+                    "rms_pct": rms_pct,
+                    "peak_pct": peak_pct,
+                    "wav_path": None,
+                }
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as converted_file:
+                converted_temp_path = converted_file.name
+
+            with wave.open(converted_temp_path, "wb") as wav_file:
+                wav_file.setnchannels(CHANNELS)
+                wav_file.setsampwidth(SAMPLE_WIDTH)
+                wav_file.setframerate(TARGET_SAMPLE_RATE)
+                wav_file.writeframes(converted_frames)
+
+            trimmed_temp_path = f"{converted_temp_path}.trimmed.wav"
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    converted_temp_path,
+                    "-af",
+                    "silenceremove=start_periods=1:start_silence=0.1:start_threshold=-35dB:stop_periods=-1:stop_silence=0.2:stop_threshold=-35dB",
+                    trimmed_temp_path,
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            transcribe_path = (
+                trimmed_temp_path
+                if Path(trimmed_temp_path).exists() and Path(trimmed_temp_path).stat().st_size > 1024
+                else converted_temp_path
+            )
+
+            if transcribe_path != converted_temp_path and Path(converted_temp_path).exists():
+                Path(converted_temp_path).unlink()
+                converted_temp_path = None
+            elif transcribe_path == converted_temp_path:
+                converted_temp_path = None
+
+            return {
+                "signal_state": signal_state,
+                "rms_pct": rms_pct,
+                "peak_pct": peak_pct,
+                "wav_path": transcribe_path,
+            }
+        finally:
+            if temp_path:
+                try:
+                    Path(temp_path).unlink()
+                except OSError:
+                    pass
+            if converted_temp_path:
+                try:
+                    Path(converted_temp_path).unlink()
+                except OSError:
+                    pass
+
+    def normalize_command_text(self, text):
+        normalized = text.lower().strip()
+        replacements = {
+            "one is": "when is",
+            "whens": "when is",
+            "whens dr": "when is dr",
+        }
+        for source, target in replacements.items():
+            normalized = normalized.replace(source, target)
+        return self.apply_db_term_corrections(normalized)
+
+    def specialty_matches(self, command, specialty, dept):
+        if specialty in command:
+            return True
+
+        spoken_words = re.findall(r"\b\w+\b", command.lower())
+        specialty_words = re.findall(r"\b\w+\b", specialty.lower())
+        meaningful_words = [word for word in specialty_words if len(word) >= 4 and word not in GENERIC_MEDICAL_WORDS]
+
+        if meaningful_words:
+            return all(
+                any(SequenceMatcher(None, target, spoken).ratio() >= 0.85 for spoken in spoken_words)
+                for target in meaningful_words
+            )
+
+        has_generic_doctor = "doctor" in spoken_words or "physician" in spoken_words
+        if has_generic_doctor:
+            for alias in dept.get("aliases", []):
+                if self.contains_word_fuzzy(command, alias, threshold=0.9, exact=len(normalize_text(alias)) <= 3):
+                    return True
+
+        return False
+
+    def wait_for_wake_word(self):
+        if self.scripted_inputs:
+            return True
+
+        if not self.enable_whisper or self.whisper_model is None:
+            return True
+
+        try:
+            while True:
+                captured = self.capture_audio_clip(WAKE_RECORD_SECONDS, show_listening_label=False)
+                if captured["signal_state"] == "Mostly silence" or not captured["wav_path"]:
+                    continue
+
+                wake_processing_start = time.perf_counter()
+                wake_text = self.transcribe_wav_path(captured["wav_path"])
+                if Path(captured["wav_path"]).exists():
+                    Path(captured["wav_path"]).unlink()
+
+                if self.contains_wake_word(wake_text):
+                    self.pending_wake_timer_start = wake_processing_start
+                    print("   WAKE HEARD: 'hey medidroid'")
+                    print("   [WAKE WORD DETECTED]")
+                    return True
+                if wake_text:
+                    print(f"   WAKE HEARD: '{wake_text}'")
+        except Exception as exc:
+            print(f"   [WAKE WORD ERROR] {exc}")
+            return False
+
+    def listen(self):
+        scripted = self.get_next_scripted_input()
+        if scripted is not None:
+            return scripted, None
+
+        if not self.enable_whisper or self.whisper_model is None:
+            print("   [!] Live listening is disabled in this mode.")
+            return None, None
+
+        try:
+            captured = self.capture_audio_clip(COMMAND_RECORD_SECONDS, show_listening_label=True)
+            if captured["signal_state"] == "Mostly silence" or not captured["wav_path"]:
+                print("   [!] Timeout")
+                return None, None
+
+            print("   PROCESSING (Local Whisper) ...")
+            text = self.transcribe_wav_path(captured["wav_path"], context_prompt=self.command_prompt)
+            if Path(captured["wav_path"]).exists():
+                Path(captured["wav_path"]).unlink()
+
+            if not normalize_text(text):
+                print("   [!] Silence / empty transcript")
+                return None, None
+
+            response_timer_start = time.perf_counter()
+            print(f"   YOU: '{text}'")
+            return text, response_timer_start
+        except Exception as exc:
+            print(f"   [CRITICAL MIC ERROR] {exc}")
+            return None, None
+
+    def contains_word_fuzzy(self, text, target_word, threshold=0.85, exact=False):
+        clean_text = text.lower()
+        clean_target = target_word.lower().replace("-", " ")
+        target_parts = clean_target.split()
+        spoken_words = re.findall(r"\b\w+\b", clean_text)
+
+        if exact:
+            if clean_target == clean_text or f" {clean_target} " in f" {clean_text} ":
+                return True
+            return False
+
+        if target_parts and all(len(part) <= 3 for part in target_parts):
+            return clean_target == clean_text or f" {clean_target} " in f" {clean_text} "
+
+        if clean_target in clean_text:
+            return True
+
+        for t_part in target_parts:
+            if len(t_part) < 4:
+                continue
+
+            for s_word in spoken_words:
+                ratio = SequenceMatcher(None, t_part, s_word).ratio()
+                if ratio >= threshold:
+                    return True
+
+        return False
+
+    def doctor_name_score(self, command, doctor):
+        score = 0.0
+        normalized_command = normalize_text(command)
+        compact_command = normalized_command.replace(" ", "")
+
+        full_name = doctor["full_name"].lower().replace("dr. ", "").strip()
+        compact_full_name = normalize_text(full_name).replace(" ", "")
+        if compact_full_name and compact_full_name in compact_command:
+            score += 10.0
+
+        token_scores = []
+        for token in tokenize_name_parts(full_name):
+            if self.contains_word_fuzzy(normalized_command, token, threshold=0.84):
+                token_scores.append(token)
+                if len(token) >= 5:
+                    score += 1.5
+                else:
+                    score += 1.0
+
+        for alias in doctor.get("aliases", []):
+            if self.contains_word_fuzzy(normalized_command, alias, threshold=0.88):
+                score += 1.2
+
+        # Favor matches that include a family name plus another identifying token.
+        family_token = doctor["family"].lower()
+        first_token = doctor["first"].lower()
+        if family_token in token_scores and len(token_scores) >= 2:
+            score += 1.0
+        if first_token in token_scores and len(token_scores) >= 2:
+            score += 0.5
+
+        return score
+
+    def match_speed_profile(self, text):
+        normalized = normalize_text(text)
+        compact = normalized.replace(" ", "")
+
+        for profile_name, profile_data in SPEED_PROFILES.items():
+            aliases = [profile_name, profile_data.get("spoken_label", ""), *profile_data["aliases"]]
+            for alias in aliases:
+                alias_norm = normalize_text(alias)
+                if alias_norm == normalized or alias_norm.replace(" ", "") == compact:
+                    return profile_name
+
+        words = normalized.split()
+        for profile_name, profile_data in SPEED_PROFILES.items():
+            aliases = [profile_name, profile_data.get("spoken_label", ""), *profile_data["aliases"]]
+            for alias in aliases:
+                alias_compact = normalize_text(alias).replace(" ", "")
+                for size in (1, 2, 3):
+                    for idx in range(len(words) - size + 1):
+                        window = "".join(words[idx : idx + size])
+                        if SequenceMatcher(None, window, alias_compact).ratio() >= 0.78:
+                            return profile_name
+
+        return None
+
+    def prompt_for_speed_profile(self, preface=None):
+        if preface:
+            self.run_async_speak(f"{preface} What speed would you like: fast, medium, or easy?")
+        else:
+            self.run_async_speak("What speed would you like: fast, medium, or easy?")
+
+        for attempt in range(2):
+            selection, selection_timer = self.listen()
+            if not selection:
+                continue
+
+            normalized = self.normalize_command_text(selection)
+            if self.is_exit_command(normalized):
+                self.pending_response_timer_start = selection_timer
+                self.run_async_speak("Shutting down. Goodbye.")
+                return {"cancelled": True}
+
+            matched_profile = self.match_speed_profile(normalized)
+            if matched_profile:
+                return {
+                    "cancelled": False,
+                    "name": matched_profile,
+                    "timer": selection_timer,
+                    "defaulted": False,
+                    **SPEED_PROFILES[matched_profile],
+                }
+
+            self.pending_response_timer_start = selection_timer
+            if attempt == 0:
+                self.run_async_speak("Please say fast, medium, or easy.")
+
+        return {
+            "cancelled": False,
+            "name": DEFAULT_SPEED_PROFILE,
+            "timer": None,
+            "defaulted": True,
+            **SPEED_PROFILES[DEFAULT_SPEED_PROFILE],
+        }
+
+    def find_doctors_in_command(self, command):
+        matches = []
+        for dept in self.db["departments"]:
+            for office in self.get_department_offices(dept):
+                doc = office["doctor"]
+                full = doc["full_name"].lower().replace("dr. ", "")
+                clean_full = normalize_text(full).replace(" ", "")
+                clean_cmd = normalize_text(command).replace(" ", "")
+                score = self.doctor_name_score(command, doc)
+
+                if score > 0:
+                    office_copy = office.copy()
+                    office_copy["dept_name"] = dept["name"]
+                    office_copy["full_match"] = clean_full in clean_cmd
+                    office_copy["match_score"] = score
+                    matches.append(office_copy)
+
+        full_matches = [match for match in matches if match.get("full_match", False)]
+        if full_matches:
+            return full_matches
+
+        if not matches:
+            return []
+
+        best_score = max(match.get("match_score", 0.0) for match in matches)
+        if best_score >= 2.0:
+            filtered = [match for match in matches if match.get("match_score", 0.0) >= best_score - 0.2]
+            return filtered
+
+        return matches
+
+    def has_incomplete_doctor_request(self, command):
+        spoken_words = re.findall(r"\b[a-z0-9]+\b", command.lower())
+        has_doctor_cue = "dr" in spoken_words or "doctor" in spoken_words or "physician" in spoken_words
+        if not has_doctor_cue:
+            return False
+
+        meaningful_tokens = extract_meaningful_command_tokens(command)
+        if not meaningful_tokens:
+            return True
+
+        return False
+
+    def handle_disambiguation(self, matches, intent):
+        doc_names = [f"{match['doctor']['full_name']} in {match['dept_name']}" for match in matches]
+        question = f"I found multiple matches: {' and '.join(doc_names)}. Which one did you mean?"
+        self.run_async_speak(question)
+
+        clarification, clarification_timer = self.listen()
+        if clarification:
+            self.pending_response_timer_start = clarification_timer
+            for match in matches:
+                doc_score = self.doctor_name_score(clarification, match["doctor"])
+                if doc_score > 0 or self.contains_word_fuzzy(clarification, match["dept_name"]):
+                    if intent == "navigate":
+                        return {"action": "NAVIGATE", "type": "doctor", "data": match, "dept": match["dept_name"]}
+                    if intent == "schedule":
+                        return {
+                            "action": "RESPOND",
+                            "response": f"{match['doctor']['full_name']} is available {match['schedule']}.",
+                        }
+
+        return {"action": "RESPOND", "response": "I didn't catch that. Please try your request again."}
+
+    def process_command(self, command):
+        if not command:
+            return None
+
+        command = self.normalize_command_text(command)
+
+        if any(word in command for word in ["emergency protocol", "having a heart attack", "dying", "heart attack"]):
+            for dept in self.db["departments"]:
+                if dept["name"] == "Emergency":
+                    return {"action": "NAVIGATE", "type": "dept", "data": dept}
+
+        if any(word in command for word in ["what department", "list department", "the department", "all department"]):
+            depts = [dept["name"] for dept in self.db["departments"]]
+            return {"action": "RESPOND", "response": f"The hospital has the following departments: {', '.join(depts)}."}
+
+        if any(word in command for word in ["who works in", "list doctors", "doctors in", "who is in", "give me the doctors"]):
+            for dept in self.db["departments"]:
+                if self.contains_word_fuzzy(command, dept["name"]):
+                    docs = [office["doctor"]["full_name"] for office in self.get_department_offices(dept)]
+                    if not docs:
+                        return {"action": "RESPOND", "response": f"{dept['name']} is a general department destination and does not have assigned office doctors in this demo."}
+                    return {"action": "RESPOND", "response": f"The doctors in {dept['name']} are {', '.join(docs)}."}
+
+        if any(word in command for word in ["when is", "schedule for", "schedule of", "when can i see"]):
+            matches = self.find_doctors_in_command(command)
+            if len(matches) == 1:
+                doc = matches[0]
+                return {"action": "RESPOND", "response": f"{doc['doctor']['full_name']} is available {doc['schedule']}."}
+            if len(matches) > 1:
+                return self.handle_disambiguation(matches, "schedule")
+
+        if any(word in command for word in ["i need a", "where is a", "looking for a", "find a", "i need the", "is a"]):
+            for dept in reversed(self.db["departments"]):
+                for office in self.get_department_offices(dept):
+                    for specialty in office.get("specialties", []):
+                        if self.specialty_matches(command, specialty.lower(), dept):
+                            name = office["doctor"]["full_name"]
+                            return {
+                                "action": "RESPOND_AND_NAVIGATE",
+                                "response": f"Our {specialty} is {name}. I will guide you to their office in {dept['name']}.",
+                                "data": office,
+                                "dept": dept["name"],
+                            }
+
+        matches = self.find_doctors_in_command(command)
+        if len(matches) == 1:
+            return {"action": "NAVIGATE", "type": "doctor", "data": matches[0], "dept": matches[0]["dept_name"]}
+        if len(matches) > 1:
+            return self.handle_disambiguation(matches, "navigate")
+        if self.has_incomplete_doctor_request(command):
+            return {"action": "RESPOND", "response": "Please say the doctor's name."}
+
+        for dept in self.db["departments"]:
+            if self.contains_word_fuzzy(command, dept["name"]):
+                return {"action": "NAVIGATE", "type": "dept", "data": dept}
+            for alias in dept.get("aliases", []):
+                if self.contains_word_fuzzy(command, alias, exact=len(normalize_text(alias)) <= 3):
+                    return {"action": "NAVIGATE", "type": "dept", "data": dept}
+
+        return None
+
+    def load_route_map(self):
+        route_map = {str(k).strip().lower(): v for k, v in DEFAULT_ROUTE_MAP.items()}
+        try:
+            if ROUTE_MAP_FILE.exists():
+                with open(ROUTE_MAP_FILE, "r", encoding="utf-8") as map_file:
+                    user_map = json.load(map_file)
+                for key, value in user_map.items():
+                    route_map[str(key).strip().lower()] = value
+        except Exception as exc:
+            print(f"[NAV] route_map.json load error: {exc}")
+        return route_map
+
+    def get_live_routes(self):
+        now = time.time()
+        if self._routes_cache is not None and now - self._routes_cache_time < 5.0:
+            return self._routes_cache
+        routes = []
+        try:
+            with urllib.request.urlopen(f"{WEBDRIVE_URL}/routes", timeout=3) as response:
+                routes = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            print(f"[NAV] could not reach webdrive at {WEBDRIVE_URL}: {exc}")
+        self._routes_cache = routes
+        self._routes_cache_time = now
+        return routes
+
+    def resolve_route_name(self, route_key):
+        if not route_key:
+            return None
+        key = str(route_key).strip().lower()
+        routes = self.get_live_routes()
+        candidates = []
+        mapped = self.route_map.get(key)
+        if mapped:
+            candidates.append(mapped)
+        candidates.extend([str(route_key), key, f"room{key}", f"room {key}"])
+        for candidate in candidates:
+            target = str(candidate).strip().lower()
+            for route in routes:
+                if str(route).strip().lower() == target:
+                    return route
+        return None
+
+    def get_webdrive_status(self):
+        try:
+            with urllib.request.urlopen(f"{WEBDRIVE_URL}/status", timeout=3) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    def wait_for_navigation_complete(self):
+        # MIC LOCK: block here (the agent is NOT listening while blocked) until the
+        # webdrive replay finishes. With mode='full' the run ends with the robot back
+        # at its initial position, so "run finished" == "back at initial position".
+        start = time.time()
+        started = False
+        while time.time() - start < NAV_RUN_START_TIMEOUT:
+            status = self.get_webdrive_status()
+            if status and status.get("mode") == "replay":
+                started = True
+                break
+            if status and status.get("mode") == "teleop" and time.time() - start > 3.0:
+                # never entered replay (e.g. webdrive rejected/failed instantly)
+                break
+            time.sleep(0.3)
+        if not started:
+            print("[NAV] warning: replay did not appear to start; not blocking the mic.")
+            return False
+
+        print("[NAV] Robot is navigating. Microphone is LOCKED until it returns to the start.")
+        announced_arrival = False
+        last_msg = None
+        start = time.time()
+        while time.time() - start < NAV_RUN_MAX_SECONDS:
+            status = self.get_webdrive_status()
+            if status is None:
+                time.sleep(0.5)
+                continue
+            msg = status.get("msg", "")
+            if msg and msg != last_msg:
+                print(f"   [NAV] {msg}")
+                last_msg = msg
+            # announce when the return leg begins (after reaching the destination)
+            if not announced_arrival and isinstance(msg, str) and (msg.startswith("BACK") or msg.startswith("SPIN")):
+                announced_arrival = True
+                self.run_async_speak("We have arrived at the destination. I will now return to the starting point.")
+            if status.get("mode") == "teleop":
+                print("[NAV] Run complete. Robot is back at the initial position. Microphone UNLOCKED.")
+                return True
+            time.sleep(0.5)
+        print("[NAV] warning: navigation wait timed out; unlocking the microphone.")
+        return False
+
+    def trigger_webdrive_route(self, route_name, speed_profile=None):
+        if speed_profile:
+            pwm = max(55, min(150, int(speed_profile.get("pwm", 100))))
+            try:
+                with urllib.request.urlopen(f"{WEBDRIVE_URL}/speed?v={pwm}", timeout=3) as response:
+                    response.read()
+            except Exception:
+                pass
+        url = f"{WEBDRIVE_URL}/run?" + urllib.parse.urlencode({"name": route_name, "mode": NAV_ROUTE_MODE})
+        if self.nav_dry_run:
+            print(f"[NAV DRY-RUN] would trigger: GET {url}")
+            return True
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                body = response.read().decode("utf-8", "replace").strip()
+            print(f"[NAV] webdrive responded: {body}")
+        except Exception as exc:
+            print(f"[NAV] webdrive trigger FAILED ({url}): {exc}")
+            return False
+        # Hold the mic until the robot has returned to its initial position.
+        return self.wait_for_navigation_complete()
+
+    def publish_nav_goal(self, coords, speed_profile=None, route_key=None):
+        if speed_profile:
+            print(
+                f"\n[ESP32 SPEED TARGET] Profile={speed_profile['name']} | PWM={speed_profile['pwm']} | "
+                f"Approx linear speed={speed_profile['linear_speed_mps']:.3f} m/s"
+            )
+        print(f"\n[ROS2 BRIDGE] PUBLISHING NAV GOAL: {{x: {coords.get('x')}, y: {coords.get('y')}, z: 0.0}}")
+
+        route_name = self.resolve_route_name(route_key)
+        if not route_name:
+            available = self.get_live_routes()
+            print(f"[NAV] No recorded route for destination '{route_key}'. Available routes: {available}")
+            self.run_async_speak(
+                "I have the destination, but there is no saved path to it yet, so I cannot drive there."
+            )
+            return
+        print(f"[NAV] Dispatching webdrive route '{route_name}' (mode={NAV_ROUTE_MODE}) for destination '{route_key}'")
+        completed = self.trigger_webdrive_route(route_name, speed_profile=speed_profile)
+        if completed and not self.nav_dry_run:
+            self.run_async_speak("We are back at the starting point. I am ready for your next request.")
+
+    def handle_result(self, result):
+        if not result:
+            self.run_async_speak("I am sorry, I could not process your request or find that information.")
+            return True
+
+        action = result["action"]
+
+        if action == "RESPOND":
+            self.run_async_speak(result["response"])
+            return True
+
+        if action == "RESPOND_AND_NAVIGATE":
+            preface = result["response"]
+            speed_profile = self.prompt_for_speed_profile(preface=preface)
+            if speed_profile.get("cancelled"):
+                return False
+            if speed_profile.get("timer") is not None:
+                self.pending_response_timer_start = speed_profile["timer"]
+
+            spoken_speed = speed_profile.get("spoken_label", speed_profile["name"]) if speed_profile else None
+            self.run_async_speak(f"Okay, we will go at {spoken_speed} speed. Follow me.")
+            self.publish_nav_goal(
+                result["data"]["coordinates"],
+                speed_profile=speed_profile,
+                route_key=result["data"].get("room"),
+            )
+            return True
+
+        if action == "NAVIGATE":
+            if result["type"] == "doctor":
+                doc = result["data"]["doctor"]["full_name"]
+                room = result["data"]["room"]
+                dept = result["dept"]
+                preface = f"I have located {doc}. They are in room {room}, inside the {dept} department."
+                speed_profile = self.prompt_for_speed_profile(preface=preface)
+                if speed_profile.get("cancelled"):
+                    return False
+                if speed_profile.get("timer") is not None:
+                    self.pending_response_timer_start = speed_profile["timer"]
+
+                spoken_speed = speed_profile.get("spoken_label", speed_profile["name"])
+                self.run_async_speak(f"Okay, we will go at {spoken_speed} speed. Follow me.")
+                self.publish_nav_goal(
+                    result["data"]["coordinates"],
+                    speed_profile=speed_profile,
+                    route_key=room,
+                )
+                return True
+
+            if result["type"] == "dept":
+                dept_name = result["data"]["name"]
+                preface = f"I am guiding you to the {dept_name} department."
+                speed_profile = self.prompt_for_speed_profile(preface=preface)
+                if speed_profile.get("cancelled"):
+                    return False
+                if speed_profile.get("timer") is not None:
+                    self.pending_response_timer_start = speed_profile["timer"]
+
+                spoken_speed = speed_profile.get("spoken_label", speed_profile["name"])
+                self.run_async_speak(f"Okay, we will go at {spoken_speed} speed. Please stay close.")
+                dept_coords = self.get_department_coordinates(result["data"])
+                self.publish_nav_goal(
+                    dept_coords,
+                    speed_profile=speed_profile,
+                    route_key=result["data"].get("name"),
+                )
+                return True
+
+        return True
+
+    def execute_command_text(self, command, response_timer_start=None):
+        normalized = command.strip().lower()
+        print(f"\nUser: {command}")
+        self.pending_response_timer_start = response_timer_start
+
+        if self.is_exit_command(normalized):
+            self.run_async_speak("Shutting down. Goodbye.")
+            return False
+
+        result = self.process_command(normalized)
+        return self.handle_result(result)
+
+    def run(self):
+        while True:
+            time.sleep(1)
+            if self.wake_word_armed:
+                wake_ok = self.wait_for_wake_word()
+                if not wake_ok:
+                    break
+                self.wake_word_armed = False
+                self.run_async_speak("System online. MediDroid at your service.")
+            command, response_timer_start = self.listen()
+
+            if command and not self.execute_command_text(command, response_timer_start=response_timer_start):
+                break
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="MediDroid Raspberry Pi voice interaction agent")
+    parser.add_argument("--list-mics", action="store_true", help="List available microphone devices and exit")
+    parser.add_argument("--mic-index", type=int, help="Use a specific microphone device index")
+    parser.add_argument("--typed-demo", action="store_true", help="Run a keyboard-driven demo without microphone transcription")
+    parser.add_argument("--mute", action="store_true", help="Disable spoken audio playback and print responses only")
+    parser.add_argument("--no-greet", action="store_true", help="Skip the startup greeting")
+    parser.add_argument("--demo-script", type=str, help="Path to a text file with one demo query per line")
+    parser.add_argument("--stt-model", type=str, default="tiny.en", help="Whisper model name to load on the Raspberry Pi")
+    parser.add_argument("--no-move", action="store_true", help="Resolve and print nav routes but do NOT trigger robot motion (safe test)")
+    return parser.parse_args()
+
+
+def load_demo_script(path):
+    with open(path, "r", encoding="utf-8") as demo_file:
+        return [line.strip() for line in demo_file if line.strip()]
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    if args.list_mics:
+        print("Available Microphones:")
+        for index, name in enumerate(sr.Microphone.list_microphone_names()):
+            print(f"{index}: {name}")
+        raise SystemExit(0)
+
+    scripted_inputs = load_demo_script(args.demo_script) if args.demo_script else None
+
+    agent = RaspberryPiVoiceAgent(
+        enable_audio=not args.mute,
+        enable_whisper=not args.typed_demo,
+        auto_greet=not args.no_greet,
+        scripted_inputs=scripted_inputs,
+        mic_index=args.mic_index,
+        stt_model=args.stt_model,
+        nav_dry_run=args.no_move,
+    )
+
+    if args.typed_demo and not scripted_inputs:
+        print("\n[SYSTEM] Typed demo mode. Enter a query, or type 'exit' to quit.")
+        while True:
+            user_input = input("\nYou> ").strip()
+            if not user_input:
+                continue
+            if not agent.execute_command_text(user_input):
+                break
+    else:
+        agent.run()

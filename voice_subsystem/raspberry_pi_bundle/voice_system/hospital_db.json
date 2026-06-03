@@ -1,0 +1,334 @@
+{
+    "departments": [
+        {
+            "name": "Room C",
+            "aliases": [
+                "room c",
+                "roomc",
+                "room see",
+                "room sea",
+                "room cee",
+                "the room c",
+                "room c please",
+                "rooms c",
+                "room ce"
+            ],
+            "description": "Recorded demonstration destination served by the roomC route",
+            "coordinates": {
+                "x": 20.0,
+                "y": -2.0
+            },
+            "offices": []
+        },
+        {
+            "name": "Cardiology",
+            "aliases": [
+                "heart",
+                "cardio",
+                "cardiac"
+            ],
+            "coordinates": {
+                "x": 12.5,
+                "y": 4.2
+            },
+            "offices": [
+                {
+                    "room": "101",
+                    "doctor": {
+                        "first": "Tariq",
+                        "family": "Al-Farsi",
+                        "full_name": "Dr. Tariq Ahmed Al-Farsi",
+                        "aliases": [
+                            "tarek",
+                            "tareq",
+                            "arik",
+                            "tarik",
+                            "alfar",
+                            "ahmed",
+                            "ahmad",
+                            "tariq ahmed",
+                            "tarik ahmed",
+                            "ahmed alfarsi",
+                            "ahmad alfarsi",
+                            "tariq alfarsi"
+                        ],
+                        "gender": "M"
+                    },
+                    "description": "General Cardiology and Consultations",
+                    "specialties": [
+                        "cardiologist",
+                        "heart doctor"
+                    ],
+                    "schedule": "Monday to Wednesday, 9 AM to 2 PM",
+                    "coordinates": {
+                        "x": 12.5,
+                        "y": 4.2
+                    }
+                },
+                {
+                    "room": "102",
+                    "doctor": {
+                        "first": "Sara",
+                        "family": "Al-Ghamdi",
+                        "full_name": "Dr. Sara Mohammed Al-Ghamdi",
+                        "aliases": [
+                            "al gandhi",
+                            "al ghandi",
+                            "sara mohammed",
+                            "mohammed alghamdi",
+                            "sara alghamdi"
+                        ],
+                        "gender": "F"
+                    },
+                    "description": "Cardiothoracic Surgery",
+                    "specialties": [
+                        "cardiac surgeon",
+                        "heart surgeon"
+                    ],
+                    "schedule": "Tuesday and Thursday, 9 AM to 4 PM",
+                    "coordinates": {
+                        "x": 13.8,
+                        "y": 4.2
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Neurology",
+            "aliases": [
+                "brain",
+                "neuro",
+                "nerves"
+            ],
+            "coordinates": {
+                "x": -5.0,
+                "y": 10.0
+            },
+            "offices": [
+                {
+                    "room": "205",
+                    "doctor": {
+                        "first": "Omar",
+                        "family": "Al-Farsi",
+                        "full_name": "Dr. Omar Khalid Al-Farsi",
+                        "aliases": [
+                            "alfar",
+                            "omar",
+                            "khalid",
+                            "khaled",
+                            "omar khalid",
+                            "omar alfarsi",
+                            "khalid alfarsi",
+                            "omar al farsi",
+                            "khalid al farsi"
+                        ],
+                        "gender": "M"
+                    },
+                    "description": "Neurological testing and surgery",
+                    "specialties": [
+                        "neurologist",
+                        "brain surgeon"
+                    ],
+                    "schedule": "Monday, Wednesday, Friday, 10 AM to 5 PM",
+                    "coordinates": {
+                        "x": -5.0,
+                        "y": 10.0
+                    }
+                },
+                {
+                    "room": "206",
+                    "doctor": {
+                        "first": "Reem",
+                        "family": "Al-Mutairi",
+                        "full_name": "Dr. Reem Faisal Al-Mutairi",
+                        "aliases": [
+                            "reem",
+                            "rima",
+                            "mutairi",
+                            "almutairi",
+                            "reem faisal",
+                            "faisal mutairi",
+                            "reem mutairi"
+                        ],
+                        "gender": "F"
+                    },
+                    "description": "Headache, epilepsy, and nerve clinic",
+                    "specialties": [
+                        "neurologist",
+                        "nerve doctor",
+                        "brain doctor"
+                    ],
+                    "schedule": "Sunday to Tuesday, 11 AM to 4 PM",
+                    "coordinates": {
+                        "x": -6.2,
+                        "y": 10.0
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Pediatrics",
+            "aliases": [
+                "children",
+                "kids",
+                "child clinic"
+            ],
+            "coordinates": {
+                "x": 20.0,
+                "y": -2.0
+            },
+            "offices": [
+                {
+                    "room": "301",
+                    "doctor": {
+                        "first": "Nada",
+                        "family": "Al-Ghamdi",
+                        "full_name": "Dr. Nada Abdullah Al-Ghamdi",
+                        "aliases": [
+                            "al gandhi",
+                            "al ghandi",
+                            "neda",
+                            "algum",
+                            "alarm",
+                            "al gand",
+                            "nada abdullah",
+                            "abdullah alghamdi",
+                            "nada alghamdi"
+                        ],
+                        "gender": "F"
+                    },
+                    "description": "General pediatric care and vaccinations",
+                    "specialties": [
+                        "pediatrician",
+                        "kids doctor",
+                        "child care"
+                    ],
+                    "schedule": "Monday to Thursday, 8 AM to 2 PM",
+                    "coordinates": {
+                        "x": 20.0,
+                        "y": -2.0
+                    }
+                },
+                {
+                    "room": "302",
+                    "doctor": {
+                        "first": "Maha",
+                        "family": "Al-Shammari",
+                        "full_name": "Dr. Maha Yousef Al-Shammari",
+                        "aliases": [
+                            "maha",
+                            "shammari",
+                            "alshammari",
+                            "maha shammari",
+                            "yousef",
+                            "yusuf",
+                            "maha yousef"
+                        ],
+                        "gender": "F"
+                    },
+                    "description": "Infant follow-up and growth assessment",
+                    "specialties": [
+                        "pediatrician",
+                        "children specialist",
+                        "baby doctor"
+                    ],
+                    "schedule": "Sunday to Wednesday, 9 AM to 3 PM",
+                    "coordinates": {
+                        "x": 21.2,
+                        "y": -2.0
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Orthopedics",
+            "aliases": [
+                "bones",
+                "ortho",
+                "joints"
+            ],
+            "coordinates": {
+                "x": 7.0,
+                "y": -8.5
+            },
+            "offices": [
+                {
+                    "room": "401",
+                    "doctor": {
+                        "first": "Faisal",
+                        "family": "Al-Harbi",
+                        "full_name": "Dr. Faisal Nasser Al-Harbi",
+                        "aliases": [
+                            "faisal",
+                            "faysal",
+                            "nasser",
+                            "nasir",
+                            "harbi",
+                            "alharbi",
+                            "faisal harbi",
+                            "nasser harbi"
+                        ],
+                        "gender": "M"
+                    },
+                    "description": "Bone fractures and joint injuries",
+                    "specialties": [
+                        "orthopedic surgeon",
+                        "bone doctor",
+                        "joint doctor"
+                    ],
+                    "schedule": "Monday to Thursday, 10 AM to 4 PM",
+                    "coordinates": {
+                        "x": 7.0,
+                        "y": -8.5
+                    }
+                },
+                {
+                    "room": "402",
+                    "doctor": {
+                        "first": "Huda",
+                        "family": "Al-Qahtani",
+                        "full_name": "Dr. Huda Saeed Al-Qahtani",
+                        "aliases": [
+                            "huda",
+                            "hoda",
+                            "saeed",
+                            "said",
+                            "qahtani",
+                            "alqahtani",
+                            "huda qahtani",
+                            "saeed qahtani"
+                        ],
+                        "gender": "F"
+                    },
+                    "description": "Spine and mobility rehabilitation",
+                    "specialties": [
+                        "orthopedist",
+                        "spine doctor",
+                        "mobility specialist"
+                    ],
+                    "schedule": "Sunday, Tuesday, Thursday, 9 AM to 1 PM",
+                    "coordinates": {
+                        "x": 8.3,
+                        "y": -8.5
+                    }
+                }
+            ]
+        },
+        {
+            "name": "Emergency",
+            "aliases": [
+                "er",
+                "emergency room",
+                "casualty",
+                "urgent care",
+                "trauma center"
+            ],
+            "description": "General emergency hallway and urgent triage area",
+            "coordinates": {
+                "x": 0.0,
+                "y": 0.0
+            },
+            "offices": []
+        }
+    ]
+}

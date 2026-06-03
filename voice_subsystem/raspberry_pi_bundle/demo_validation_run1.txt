@@ -1,0 +1,12 @@
+What departments are in this hospital?
+Where is dr ahmed?
+medium
+Where is dr omar khalid al-farsi?
+fast
+Where is emergency?
+easy
+Where is orthopedics?
+medium
+Where is dr maha?
+fast
+stop

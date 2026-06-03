@@ -1,135 +1,64 @@
-# MediDroid - Autonomous Hospital Navigation Robot
+# MediDroid
 
-A 4-wheel differential drive autonomous robot for hospital navigation using ROS 2 and Nav2. The robot can navigate to departments, doctor rooms, and specific locations via voice commands or text input.
+An autonomous differential-drive hospital delivery robot built on a Raspberry Pi 5
+with ROS 2 Jazzy. MediDroid combines LiDAR SLAM/Nav2 navigation, IMU-fused heading,
+an ESP32 motor controller, and a local voice command subsystem so staff can send it
+to rooms by voice.
+
+This repository is a full snapshot of the on-robot project: ROS 2 workspace, standalone
+nodes, saved maps, the voice subsystem, and the engineering notes accumulated while
+building it.
 
 ## Hardware
 
-- **Compute**: Raspberry Pi 5 (Ubuntu 24.04 LTS, ROS 2 Jazzy)
-- **Motor Controller**: ESP32 with WiFi AP + Serial bridge
-- **Motor Drivers**: 2x IBT_2 H-bridge (12V)
-- **Motors**: 4x DC motors with rear encoders
-- **LiDAR**: RPLIDAR C1
-- **Sensors**: HC-SR04 Ultrasonic, 3x obstacle LEDs
-- **Power**: 12V 9A battery with buck converter to 5V
+- **Compute:** Raspberry Pi 5 (Ubuntu 24.04 LTS, ROS 2 Jazzy)
+- **Motor controller:** ESP32 (serial `M,left,right` PWM protocol)
+- **Drive:** 4x DC motors w/ encoders, 2x IBT_2 H-bridges, differential drive
+- **LiDAR:** RPLIDAR C1
+- **IMU:** MPU-9255 (gyro-Z used for heading, fused via EKF)
+- **Power:** 12V battery → buck converter → 5V Pi/ESP32
 
-## Repository Structure
+## Repository layout
 
-```
-medidroid_github/
-├── esp32/                          # ESP32 motor controller firmware
-│   └── esp32claude/
-│       ├── esp32claude.ino         # Main firmware (WiFi AP, serial, encoders, ultrasonic)
-│       └── drive_mixing.h          # Motor mixing with car-style arc turns
-├── ros2_ws/src/
-│   ├── medidroid_base/             # Main ROS 2 package
-│   │   ├── medidroid_base/
-│   │   │   ├── esp32_driver.py     # cmd_vel to ESP32 serial bridge + encoder odom
-│   │   │   ├── safety_gate.py      # Motor bridge with decisive mode control
-│   │   │   ├── go_to.py            # Hospital waypoint navigator (rooms, departments, doctors)
-│   │   │   ├── voice_command.py    # Voice/text command interface (Vosk STT + Nav2)
-│   │   │   ├── obstacle_detector.py# LiDAR-based obstacle detection
-│   │   │   ├── pose_manager.py     # Pose tracking and management
-│   │   │   └── wasd_teleop.py      # Keyboard teleoperation
-│   │   ├── launch/
-│   │   │   ├── nav_hardware_launch.py  # LiDAR + static TF + rf2o odometry
-│   │   │   └── nav_launch.py           # Full Nav2 stack
-│   │   ├── config/
-│   │   │   └── nav2_params.yaml    # Nav2 config (Regulated Pure Pursuit controller)
-│   │   ├── setup.py
-│   │   ├── setup.cfg
-│   │   └── package.xml
-│   ├── mapping_launch.py           # SLAM mapping launch
-│   ├── slam_launch.py              # SLAM Toolbox launch
-│   ├── slam_params.yaml            # SLAM Toolbox parameters
-│   ├── nav_hardware_launch.py      # Hardware launch (standalone)
-│   ├── fixed_launch.py             # Fixed frame launch
-│   ├── my_robot_launch.py          # Robot launch with lifecycle manager
-│   └── pi_motor_driver.py          # Pi-based motor driver (legacy)
-├── maps/                           # Map YAML configs (.pgm files excluded)
-│   ├── my_home_map.yaml
-│   ├── basement_map.yaml
-│   └── basement1_map.yaml
-└── scripts/
-    ├── start_robot.sh              # Quick-start robot script
-    └── launch_nav.sh               # Navigation launch script
-```
+| Path | What it is |
+|------|------------|
+| `ros2_ws/src/medidroid_base/` | Main ROS 2 package: `safety_gate`, `esp32_driver`, `obstacle_detector`, teleop, route/voice nodes, Nav2 params, launch files |
+| `ros2_ws/src/sllidar_ros2/`, `rf2o_laser_odometry/` | Third-party LiDAR driver + laser odometry (vendored sources) |
+| `imu_mpu9255_node.py` | Standalone IMU node → `/imu/data_raw` @ 100 Hz with continuous bias tracking |
+| `webdrive.py` | HTTP teleop + route record/replay server (the validated motion path) |
+| `ekf.yaml` | robot_localization EKF config (rf2o X/Y + IMU yaw → `odom→base_link`) |
+| `voice sub system/` | Local voice agent (faster-whisper STT + edge-tts TTS), hospital DB, route map |
+| `*_map.pgm` / `*_map.yaml` | Saved occupancy-grid maps |
+| `docs/engineering_memory/` | Detailed engineering notes: navigation tuning, IMU/EKF integration, the safety-gate rewrite, localization debugging |
+| `*.py` (home-dir) | Assorted calibration, patch, and diagnostic scripts from development |
 
-## Hospital Database
+## Navigation architecture
 
-The robot knows these locations:
+- **Heading / rotation:** IMU gyro-Z (authoritative) — fixes rf2o's in-place-rotation blindness
+- **Translation X/Y:** LiDAR `rf2o_laser_odometry`
+- **Absolute localization:** LiDAR AMCL (`map→odom`); AMCL `alpha1/alpha2 = 0.02` trusts IMU rotation
+- **Obstacle avoidance:** Nav2 costmaps + `collision_monitor` + a 360° LiDAR safety zone in `safety_gate`
+- **cmd_vel chain:** `controller_server` → `velocity_smoother` → `collision_monitor` → `safety_gate` → ESP32 serial
 
-| Department   | Hallway Point | Aliases                            |
-|-------------|---------------|-------------------------------------|
-| Cardiology  | hall_1        | heart, cardio, cardiac              |
-| Neurology   | hall_2        | brain, neuro, nerves                |
-| Pediatrics  | hall_3        | children, kids, child clinic        |
-| Orthopedics | hall_4        | bones, ortho, joints                |
-| Emergency   | hall_5        | er, emergency room, casualty        |
+See `docs/engineering_memory/` for the full reasoning and tuning history.
 
-8 doctors across 8 rooms (101, 102, 205, 206, 301, 302, 401, 402) with name aliases.
+## Voice subsystem
 
-## Quick Start
+Fully local/offline-capable speech pipeline (no cloud API keys):
 
-### On the Raspberry Pi
+- **STT:** `faster-whisper` (`tiny.en`, cached locally)
+- **TTS:** `edge-tts` (free Microsoft Edge voices; needs internet)
+- Wake word → command → resolves a doctor/department/room → triggers a recorded
+  Nav route via `webdrive.py`
 
-```bash
-# Terminal 1: Hardware (LiDAR + TF + odometry)
-ros2 launch medidroid_base nav_hardware_launch.py
+## Notes
 
-# Terminal 2: Motor bridge
-ros2 run medidroid_base safety_gate
+- Credentials (SSH password, Wi-Fi keys) referenced in the historical engineering notes
+  have been redacted to `<REDACTED_*>` placeholders.
+- `build/`, `install/`, virtualenvs, and large binaries are intentionally excluded;
+  rebuild the workspace with `colcon build`.
 
-# Terminal 3: Navigation stack
-ros2 launch medidroid_base nav_launch.py
+## License
 
-# Terminal 4: Voice commands
-ros2 run medidroid_base voice_command
-```
-
-### Voice / Text Commands
-
-```bash
-# Via microphone (requires Vosk model):
-# "Go to cardiology"
-# "Take me to Doctor Tariq"
-# "Go home"
-# "Stop"
-
-# Via ROS 2 topic:
-ros2 topic pub --once /voice_text std_msgs/String "data: go to cardiology"
-ros2 topic pub --once /voice_text std_msgs/String "data: take me to doctor tariq"
-
-# Direct waypoint navigation:
-ros2 run medidroid_base go_to --ros-args -p target:=cardiology
-ros2 run medidroid_base go_to --ros-args -p target:=dr_tariq
-ros2 run medidroid_base go_to --ros-args -p target:=room_101
-ros2 run medidroid_base go_to --ros-args -p target:=list
-```
-
-## Dependencies
-
-### Pi (ROS 2)
-- ROS 2 Jazzy
-- Nav2
-- SLAM Toolbox
-- rf2o_laser_odometry
-- sllidar_ros2 (RPLIDAR driver)
-- pyserial, vosk, pyaudio, flite
-
-### ESP32
-- Arduino IDE / PlatformIO
-- WiFi, WebServer libraries (built-in)
-
-## Pi Connection
-
-- WiFi Hotspot: `MyHotspot` on wlan0
-- SSH: `ssh medidroid@raspberrypi.local`
-- IP: `10.42.0.1`
-
-## USB / udev Rules
-
-```
-# /etc/udev/rules.d/99-usb-serial.rules
-SUBSYSTEM=="tty", ATTRS{product}=="CP2102 USB to UART Bridge Controller", SYMLINK+="ttyESP32"
-SUBSYSTEM=="tty", ATTRS{product}=="CP2102N USB to UART Bridge Controller", SYMLINK+="ttyLIDAR"
-```
+See `LICENSE` files within vendored third-party packages. Project code is released
+for open-source use.

@@ -1,0 +1,12 @@
+What departments are in this hospital?
+Where is dr sara?
+medium
+Where is dr reem?
+easy
+Where is dr nada?
+fast
+Where is cardiology?
+medium
+Where is emergency?
+easy
+stop

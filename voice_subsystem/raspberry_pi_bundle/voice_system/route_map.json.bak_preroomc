@@ -1,0 +1,9 @@
+{
+  "_comment": "Maps a hospital_db destination key (room number or department name, lowercased) to a recorded webdrive route name (files in /home/medidroid/routes/*.csv). Edit freely. Department keys are fallbacks used when a specific room route is not listed.",
+  "101": "roomA",
+  "205": "roomB",
+  "301": "roomC",
+  "cardiology": "roomA",
+  "neurology": "roomB",
+  "pediatrics": "roomC"
+}
