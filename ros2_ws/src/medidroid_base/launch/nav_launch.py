@@ -6,7 +6,6 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 import os
 
-
 def generate_launch_description():
     nav2_bringup_dir = get_package_share_directory('nav2_bringup')
     medidroid_base_dir = get_package_share_directory('medidroid_base')
@@ -14,19 +13,20 @@ def generate_launch_description():
     params_file = os.path.join(medidroid_base_dir, 'config', 'nav2_params.yaml')
     map_yaml_file = LaunchConfiguration('map')
 
-    # Nav2 full bringup (map_server + amcl + all nav nodes)
     bringup_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(nav2_bringup_dir, 'launch', 'bringup_launch.py')
         ),
-        launch_arguments=[
-            ('use_sim_time', 'false'),
-            ('params_file', params_file),
-            ('map', map_yaml_file),
-        ]
+        launch_arguments={
+            'use_sim_time': 'false',
+            'params_file': params_file,
+            'map': map_yaml_file,
+            'autostart': 'true',
+        }.items(),
     )
 
-    # Pose manager (saves/restores robot pose across restarts)
+    # Saves AMCL's pose to disk and restores it on next boot — no manual
+    # "2D Pose Estimate" needed after the very first run.
     pose_manager = Node(
         package='medidroid_base',
         executable='pose_manager',

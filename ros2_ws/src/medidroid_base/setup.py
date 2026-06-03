@@ -33,6 +33,10 @@ setup(
             'pose_manager = medidroid_base.pose_manager:main',
             'go_to = medidroid_base.go_to:main',
             'voice_command = medidroid_base.voice_command:main',
+            'hardcoded_nav = medidroid_base.hardcoded_nav:main',
+            'route_executor = medidroid_base.route_executor:main',
+            'voice_listener = medidroid_base.voice_listener:main',
+            'teach_route = medidroid_base.teach_route:main',
         ],
     },
 )
