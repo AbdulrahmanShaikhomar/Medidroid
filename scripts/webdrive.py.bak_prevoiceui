@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+import serial, time, threading, math, signal, sys, os, json
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+PORT=8080; DEV='/dev/ttyESP32'; BAUD=115200
+MAX_PWM=150; MIN_PWM=55; RBAL=0.82; DEAD=0.08; WATCHDOG=0.4
+FRONT_STOP=0.30; FRONT_ARC=1.047
+DRIVE_L0=100; DRIVE_R0=82; DRIVE_KP=2.5; TRIM_MAX=35
+TURN_TOL=6.0; TURN_MAXIT=16; RIGHT_SCALE=0.80
+WP_STEP=0.25; MAX_SEG=0.35; TURN_MIN=10.0; WAIT_MAX=8.0
+ROUTES='/home/medidroid/routes'; os.makedirs(ROUTES, exist_ok=True)
+
+def clampf(v,a,b): return a if v<a else (b if v>b else v)
+def yaw_of(q): return math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))
+def norm(a):
+    while a>180: a-=360
+    while a<-180: a+=360
+    return a
+
+class Bot(Node):
+    def __init__(self):
+        super().__init__('webdrive')
+        self.ox=None; self.oy=None; self.oyaw=0.0; self.ot=0.0
+        self.scan=None; self.front=float('inf'); self.st=0.0
+        self.create_subscription(Odometry,'/odom',self.o,20)
+        self.create_subscription(LaserScan,'/scan',self.sc,10)
+    def o(self,m):
+        self.ox=m.pose.pose.position.x; self.oy=m.pose.pose.position.y
+        self.oyaw=yaw_of(m.pose.pose.orientation); self.ot=time.time()
+    def sc(self,m):
+        self.scan=m; self.st=time.time(); cf=float('inf'); a=m.angle_min
+        for r in m.ranges:
+            if m.range_min<r<m.range_max and (math.pi-abs(a))<=FRONT_ARC and r<cf: cf=r
+            a+=m.angle_increment
+        self.front=cf
+
+rclpy.init(); node=Bot()
+threading.Thread(target=lambda: [rclpy.spin_once(node,timeout_sec=0.1) for _ in iter(int,1)],
+                 daemon=True).start()
+
+try:
+    # exclusive=True: refuse to share the tty. Prevents safety_gate (T2) from
+    # opening the same port and interleaving M,0,0 watchdog writes against our
+    # drive commands (the "stutter in place / motors look dead" trap).
+    ser=serial.Serial(DEV,BAUD,timeout=0.05,exclusive=True)
+except Exception as e:
+    print("SERIAL OPEN FAILED: %s (is safety_gate/T2 holding the port?)"%e); sys.exit(1)
+time.sleep(0.3)
+
+state={'x':0.0,'y':0.0,'t':0.0,'spd':100,'rec':False,'name':'','poses':[],
+       'mode':'teleop','abort':False,'runmsg':''}
+lock=threading.Lock()
+_logf=[None]
+def lg(m):
+    try:
+        if _logf[0]: _logf[0].write(m+"\n"); _logf[0].flush()
+    except Exception: pass
+    with lock: state['runmsg']=m
+
+# ---- teleop serial writer (yields while replay owns the port) ----
+def writer():
+    while True:
+        if state['mode']=='replay':
+            time.sleep(0.05); continue
+        with lock:
+            x=state['x']; y=state['y']; t=state['t']; spd=state['spd']
+        if time.time()-t>WATCHDOG or math.hypot(x,y)<DEAD:
+            try: ser.write(b'M,0,0\n')
+            except Exception: pass
+            time.sleep(0.05); continue
+        left=y+x; right=y-x
+        mx=max(1.0,abs(left),abs(right)); left/=mx; right/=mx
+        L=left*spd; R=right*spd*RBAL
+        def fix(v):
+            v=int(v)
+            if 0<abs(v)<MIN_PWM: v=MIN_PWM if v>0 else -MIN_PWM
+            return int(clampf(v,-spd,spd))
+        try: ser.write(("M,%d,%d\n"%(fix(L),fix(R))).encode())
+        except Exception: pass
+        time.sleep(0.05)
+
+def recorder():
+    while True:
+        time.sleep(0.1)
+        with lock:
+            if not state['rec'] or node.ox is None: continue
+            state['poses'].append((time.time(),node.ox,node.oy,node.oyaw))
+
+threading.Thread(target=writer,daemon=True).start()
+threading.Thread(target=recorder,daemon=True).start()
+
+def pathlen(ps): return sum(math.hypot(ps[i][1]-ps[i-1][1],ps[i][2]-ps[i-1][2]) for i in range(1,len(ps)))
+
+# ---- replay primitives (active only in replay mode; writer thread yields) ----
+def rsend(l,r):
+    l=int(l); r=int(r)
+    if 0<abs(l)<MIN_PWM: l=MIN_PWM if l>0 else -MIN_PWM
+    if 0<abs(r)<MIN_PWM: r=MIN_PWM if r>0 else -MIN_PWM
+    l=int(clampf(l,-MAX_PWM,MAX_PWM)); r=int(clampf(r,-MAX_PWM,MAX_PWM))
+    try: ser.write(("M,%d,%d\n"%(l,r)).encode())
+    except Exception: pass
+def rstop():
+    for _ in range(5):
+        try: ser.write(b'M,0,0\n')
+        except Exception: pass
+        time.sleep(0.02)
+def getscan(to=2.0):
+    node.scan=None; t0=time.time()
+    while node.scan is None and time.time()-t0<to and rclpy.ok(): time.sleep(0.02)
+    return node.scan
+def arr(sc):
+    a=np.array(sc.ranges,dtype=float); bad=~np.isfinite(a)|(a<sc.range_min)|(a>sc.range_max); a[bad]=np.nan; return a
+def xshift(ref,cur):
+    n=len(ref); r=ref.copy(); c=cur.copy()
+    rm=np.nanmean(r); cm=np.nanmean(c); r[np.isnan(r)]=rm; c[np.isnan(c)]=cm; r-=rm; c-=cm
+    R=np.fft.rfft(r); C=np.fft.rfft(c); corr=np.fft.irfft(R*np.conj(C),n=n)
+    sh=int(np.argmax(corr))
+    if sh>n//2: sh-=n
+    return sh
+def pulse(sgn,run):
+    rsend(-150*sgn,int(150*sgn*RIGHT_SCALE)); time.sleep(0.13)
+    t0=time.time()
+    while time.time()-t0<run:
+        if state['abort']: break
+        rsend(-110*sgn,int(110*sgn*RIGHT_SCALE)); time.sleep(0.05)
+    rstop()
+def turn(target):
+    ref=getscan()
+    if ref is None: return 0.0
+    ainc=ref.angle_increment; refa=arr(ref); turned=0.0; sgn=1 if target>0 else -1
+    for it in range(TURN_MAXIT):
+        if state['abort']: break
+        rem=abs(target)-abs(turned)
+        if rem<=TURN_TOL: break
+        run=0.45 if rem>35 else (0.22 if rem>15 else 0.12)
+        pulse(sgn,run); time.sleep(0.45)
+        cur=getscan()
+        if cur is None: break
+        turned=math.degrees(xshift(refa,arr(cur))*ainc)
+    return turned
+def drive(dist):
+    t0=time.time()
+    while node.ox is None and time.time()-t0<2 and rclpy.ok(): time.sleep(0.05)
+    if node.ox is None: return 0.0,"NO_ODOM"
+    x0,y0,yaw0=node.ox,node.oy,node.oyaw; d=0.0; reason="ok"; t0=time.time(); MAXT=dist/0.04+8
+    while True:
+        if state['abort']: reason="abort"; break
+        d=math.hypot(node.ox-x0,node.oy-y0)
+        if d>=dist: break
+        if node.front<FRONT_STOP: reason="FRONT_BLOCKED"; break
+        if time.time()-t0>MAXT: reason="timeout"; break
+        err=norm(math.degrees(node.oyaw)-math.degrees(yaw0))
+        trim=clampf(DRIVE_KP*err,-TRIM_MAX,TRIM_MAX)
+        rsend(DRIVE_L0+trim,DRIVE_R0-trim); time.sleep(0.03)
+    rstop(); return d,reason
+def drive_wait(dist):
+    seg=min(dist,MAX_SEG)
+    d,reason=drive(seg)
+    if reason!="FRONT_BLOCKED": return d,reason
+    lg("   obstacle <%.2fm - waiting up to %.0fs"%(FRONT_STOP,WAIT_MAX))
+    t0=time.time()
+    while time.time()-t0<WAIT_MAX:
+        if state['abort']: return d,"abort"
+        if node.front>=FRONT_STOP+0.10: lg("   clear - resuming"); return d,"ok"
+        time.sleep(0.1)
+    return d,"BLOCKED_GIVEUP"
+def opose():
+    if node.ox is None: return None
+    return node.ox,node.oy,node.oyaw
+
+def load(name):
+    p=os.path.join(ROUTES,name+'.csv'); pts=[]
+    if not os.path.exists(p): return pts
+    with open(p) as f:
+        for ln in f:
+            c=ln.strip().split(',')
+            if len(c)>=4: pts.append((float(c[1]),float(c[2]),float(c[3])))
+    return pts
+def downsample(pts,step):
+    if not pts: return []
+    wp=[pts[0]]; acc=0.0
+    for i in range(1,len(pts)):
+        acc+=math.hypot(pts[i][0]-pts[i-1][0],pts[i][1]-pts[i-1][1])
+        if acc>=step: wp.append(pts[i]); acc=0.0
+    if wp[-1]!=pts[-1]: wp.append(pts[-1])
+    return wp
+def xform(pts,ref,cur):
+    # TRANSLATE-ONLY anchor: shift the recorded path so its reference point `ref`
+    # (route start for THERE, route end for BACK) sits at the robot's current
+    # position. We deliberately do NOT rotate the path to the current heading:
+    # leg() turns the robot to face each waypoint via true bearings, so a wrong
+    # facing gets actively CORRECTED instead of baked in. (The old rigid-rotate
+    # made the robot drive off along whatever way it happened to face.)
+    rx,ry=ref[0],ref[1]; cx,cy=cur[0],cur[1]
+    return [(cx+(qx-rx), cy+(qy-ry)) for (qx,qy,*_) in pts]
+def leg(tx,ty,cur,tag):
+    po=opose()
+    if po is None: lg(tag+" NO ODOM"); state['abort']=True; return cur
+    px,py,_=po; dx=tx-px; dy=ty-py; dist=math.hypot(dx,dy)
+    if dist<0.07: return cur
+    td=norm(math.degrees(math.atan2(dy,dx))-math.degrees(cur))
+    lg("%s at(%.2f,%.2f h%+.0f)->(%.2f,%.2f) d=%.2f turn=%+.0f"%(tag,px,py,math.degrees(cur),tx,ty,dist,td))
+    if abs(td)>=TURN_MIN:
+        got=turn(td); cur+=math.radians(got)
+        if state['abort']: return cur
+    d,reason=drive_wait(dist); lg("   drove %.2f (%s)"%(d,reason))
+    po2=opose()
+    if po2 and d>0.08: cur=po2[2]
+    if reason=="BLOCKED_GIVEUP": state['abort']=True
+    return cur
+def follow(w,cur,label):
+    for i in range(len(w)):
+        if state['abort']: break
+        cur=leg(w[i][0],w[i][1],cur,"%s%d/%d"%(label,i+1,len(w)))
+    return cur
+def spin360(cur):
+    lg("SPIN 360")
+    for k in range(4):
+        if state['abort']: break
+        got=turn(90); cur+=math.radians(got); time.sleep(0.3)
+        lg("  spin %d/4: +%.0f"%(k+1,got))
+    return cur
+def run_route(name,mode):
+    if state['mode']=='replay': return
+    state['mode']='replay'; state['abort']=False
+    try: _logf[0]=open('/tmp/replay.log','w')
+    except Exception: _logf[0]=None
+    try:
+        pts=load(name)
+        if not pts or len(pts)<2: lg("no route '%s'"%name); return
+        wp=downsample(pts,WP_STEP)
+        po=opose()
+        if po is None: lg("NO /odom - start T1 (nav_hardware_launch)"); return
+        cur=po[2]; here=(po[0],po[1],po[2])
+        ref=pts[-1] if mode=='back' else pts[0]
+        tw=xform(wp,ref,here)
+        lg("RUN '%s' mode=%s: %d pts -> %d wp; aligned start->here(%.2f,%.2f h%+.0f)"
+           %(name,mode,len(pts),len(wp),here[0],here[1],math.degrees(cur)))
+        if mode=='there': seqs=[('THERE ',tw)]
+        elif mode=='back': seqs=[('BACK ',list(reversed(tw)))]
+        else: seqs=[('THERE ',tw),('SPIN',None),('BACK ',list(reversed(tw)))]
+        for label,w in seqs:
+            if state['abort']: break
+            if label=='SPIN': cur=spin360(cur); continue
+            cur=follow(w,cur,label)
+        lg("=== RUN %s ==="%("ABORTED" if state['abort'] else "DONE"))
+    except Exception as e:
+        lg("RUN ERROR: %r"%e)
+    finally:
+        rstop()
+        with lock: state['mode']='teleop'; state['x']=0.0; state['y']=0.0; state['t']=0.0
+        try:
+            if _logf[0]: _logf[0].close()
+        except Exception: pass
+        _logf[0]=None
+
+def diag():
+    # Bisection self-test: run the EXACT replay send path (M,DRIVE_L0,DRIVE_R0) in
+    # isolation for ~1s with the teleop writer silenced, and report whether bytes
+    # reached the port and whether rf2o odom actually moved. Motion (~0.2m).
+    if state['mode']=='replay': return {'err':'busy'}
+    state['mode']='replay'
+    res={}
+    try:
+        p0=opose(); f0=node.front
+        res['start']=None if p0 is None else (round(p0[0],3),round(p0[1],3),round(math.degrees(p0[2]),1))
+        res['front0']=None if not math.isfinite(f0) else round(f0,3)
+        wr=0; fail=0; t0=time.time()
+        while time.time()-t0<1.0:
+            try: ser.write(("M,%d,%d\n"%(DRIVE_L0,DRIVE_R0)).encode()); wr+=1
+            except Exception as e: fail+=1; res['exc']=repr(e)
+            time.sleep(0.03)
+        rstop()
+        p1=opose()
+        res['end']=None if p1 is None else (round(p1[0],3),round(p1[1],3),round(math.degrees(p1[2]),1))
+        res['moved']=None if (p0 is None or p1 is None) else round(math.hypot(p1[0]-p0[0],p1[1]-p0[1]),3)
+        res['writes']=wr; res['write_fail']=fail; res['cmd']='M,%d,%d'%(DRIVE_L0,DRIVE_R0)
+    except Exception as e:
+        res['error']=repr(e)
+    finally:
+        rstop()
+        with lock: state['mode']='teleop'; state['x']=0.0; state['y']=0.0; state['t']=0.0
+    return res
+
+HTML=r"""<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>MediDroid Drive</title>
+<style>
+*{box-sizing:border-box;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+body{margin:0;font-family:system-ui,Arial;background:#111;color:#eee;text-align:center;overflow-y:auto}
+h1{font-size:17px;margin:6px}
+#joy{position:relative;width:210px;height:210px;margin:8px auto;border-radius:50%;
+  background:#222;border:2px solid #444;touch-action:none}
+#stick{position:absolute;width:80px;height:80px;left:65px;top:65px;border-radius:50%;
+  background:#2d7;opacity:.85}
+.row{display:flex;justify-content:center;gap:10px;margin:7px;align-items:center;flex-wrap:wrap}
+button{font-size:15px;padding:12px 10px;border:0;border-radius:10px;background:#345;color:#fff;
+  min-width:84px;touch-action:none}
+button:active{background:#4a7}
+#stop{background:#c33;font-size:21px;padding:16px;min-width:220px;font-weight:bold}
+#stop:active{background:#e55}
+input[type=text]{font-size:16px;padding:9px;border-radius:8px;border:0;width:150px}
+#spd{width:200px}
+#st{font-size:12px;color:#9ad;height:16px}
+#recst{font-size:13px;color:#fd7;min-height:18px}
+.rt{margin:5px;padding:6px;background:#1b1b1b;border-radius:8px}
+.rt b{color:#8df}
+.mini{min-width:0;padding:8px 10px;font-size:14px}
+</style></head><body>
+<h1>MediDroid Drive</h1>
+<div id=joy><div id=stick></div></div>
+<div class=row><button id=fwd>Fwd</button><button id=bwd>Back</button></div>
+<div class=row><button id=spl>Spin L</button><button id=spr>Spin R</button></div>
+<div class=row><button id=stop>STOP</button></div>
+<div class=row>Speed <input id=spd type=range min=55 max=150 value=100></div>
+<div id=st>idle</div>
+<hr style="border-color:#333;width:90%">
+<div class=row><input id=rname type=text placeholder="destination name"><button id=rec>Record</button></div>
+<div id=recst></div>
+<div id=routes>(loading)</div>
+<script>
+let X=0,Y=0,active=false,recording=false;
+const st=document.getElementById('st');
+const joy=document.getElementById('joy'),stick=document.getElementById('stick');
+const R=105,MX=72;
+function send(){fetch('/cmd?x='+X.toFixed(2)+'&y='+Y.toFixed(2)).catch(function(){});
+  st.textContent='x='+X.toFixed(2)+' y='+Y.toFixed(2);}
+function stopAll(){active=false;X=0;Y=0;fetch('/stop').catch(function(){});
+  st.textContent='STOP';stick.style.left='65px';stick.style.top='65px';}
+setInterval(function(){ if(active) send(); },66);
+function joyMove(e){
+  const r=joy.getBoundingClientRect();
+  let px=e.clientX-(r.left+R), py=e.clientY-(r.top+R);
+  let d=Math.hypot(px,py),a=Math.atan2(py,px);
+  if(d>MX)d=MX;
+  let sx=Math.cos(a)*d,sy=Math.sin(a)*d;
+  stick.style.left=(65+sx)+'px';stick.style.top=(65+sy)+'px';
+  X=sx/MX;Y=-sy/MX;
+}
+joy.addEventListener('pointerdown',function(e){active=true;joy.setPointerCapture(e.pointerId);joyMove(e);});
+joy.addEventListener('pointermove',function(e){if(active)joyMove(e);});
+joy.addEventListener('pointerup',stopAll);
+joy.addEventListener('pointercancel',stopAll);
+function hold(id,x,y){var b=document.getElementById(id);
+  b.addEventListener('pointerdown',function(e){active=true;X=x;Y=y;b.setPointerCapture(e.pointerId);});
+  b.addEventListener('pointerup',stopAll);
+  b.addEventListener('pointercancel',stopAll);}
+hold('fwd',0,1);hold('bwd',0,-1);hold('spl',-1,0);hold('spr',1,0);
+document.getElementById('stop').addEventListener('pointerdown',stopAll);
+document.getElementById('spd').addEventListener('input',function(e){
+  fetch('/speed?v='+e.target.value).catch(function(){});});
+const recBtn=document.getElementById('rec'),rname=document.getElementById('rname'),recst=document.getElementById('recst');
+recBtn.addEventListener('click',function(){
+  if(!recording){
+    var nm=rname.value.trim(); if(!nm){recst.textContent='enter a destination name first';return;}
+    fetch('/rec_start?name='+encodeURIComponent(nm)).then(function(){
+      recording=true;recBtn.textContent='Stop & Save';recBtn.style.background='#c33';});
+  } else {
+    fetch('/rec_stop').then(function(r){return r.text();}).then(function(t){
+      recording=false;recBtn.textContent='Record';recBtn.style.background='#345';recst.textContent=t;loadRoutes();});
+  }
+});
+function runRoute(nm,md){var w=(md=='back')?'BACK along '+nm:'go to '+nm+', 360, then back';
+  if(confirm('RUN: '+w+'?\nClear the path. STOP button aborts.'))
+    fetch('/run?name='+encodeURIComponent(nm)+'&mode='+md).catch(function(){});}
+function loadRoutes(){fetch('/routes').then(function(r){return r.json();}).then(function(a){
+  var el=document.getElementById('routes');
+  if(!a.length){el.innerHTML='<div style="color:#888">no routes saved yet</div>';return;}
+  el.innerHTML='';
+  a.forEach(function(nm){
+    var d=document.createElement('div');d.className='rt';
+    var t=document.createElement('b');t.textContent=nm+'  ';d.appendChild(t);
+    var b1=document.createElement('button');b1.className='mini';b1.textContent='Run (there>360>back)';
+    b1.onclick=function(){runRoute(nm,'full');};d.appendChild(b1);
+    var b2=document.createElement('button');b2.className='mini';b2.textContent='Back only';b2.style.marginLeft='6px';
+    b2.onclick=function(){runRoute(nm,'back');};d.appendChild(b2);
+    el.appendChild(d);
+  });});}
+loadRoutes();
+setInterval(function(){fetch('/status').then(function(r){return r.json();}).then(function(s){
+  if(s.mode=='replay') recst.textContent='RUN: '+s.msg;
+  else if(s.rec) recst.textContent='REC "'+s.name+'": '+s.count+' pts, '+s.dist+' m'+(s.odom?'':' [NO /odom - start T1!]');
+}).catch(function(){});},500);
+</script></body></html>"""
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self,*a): pass
+    def _send(self,code,body,ctype='text/plain'):
+        b=body if isinstance(body,bytes) else body.encode()
+        self.send_response(code); self.send_header('Content-Type',ctype)
+        self.send_header('Content-Length',str(len(b))); self.end_headers()
+        self.wfile.write(b)
+    def do_GET(self):
+        u=urlparse(self.path); q=parse_qs(u.query); p=u.path
+        if p in ('/','/index.html'):
+            self._send(200,HTML,'text/html')
+        elif p=='/cmd':
+            try:
+                x=clampf(float(q.get('x',['0'])[0]),-1,1); y=clampf(float(q.get('y',['0'])[0]),-1,1)
+            except Exception: x=y=0.0
+            with lock: state['x']=x; state['y']=y; state['t']=time.time()
+            self._send(200,'ok')
+        elif p=='/stop':
+            state['abort']=True
+            with lock: state['x']=0.0; state['y']=0.0; state['t']=0.0
+            self._send(200,'stopped')
+        elif p=='/speed':
+            try: sp=int(clampf(float(q.get('v',['100'])[0]),MIN_PWM,MAX_PWM))
+            except Exception: sp=100
+            with lock: state['spd']=sp
+            self._send(200,'speed %d'%sp)
+        elif p=='/rec_start':
+            nm=q.get('name',[''])[0].strip().replace('/','_').replace(' ','_')
+            if not nm: self._send(400,'no name'); return
+            with lock: state['name']=nm; state['poses']=[]; state['rec']=True
+            self._send(200,'recording '+nm)
+        elif p=='/rec_stop':
+            with lock:
+                state['rec']=False; ps=list(state['poses']); nm=state['name']
+            if not nm or len(ps)<2: self._send(400,'nothing recorded (drive while recording)'); return
+            with open(os.path.join(ROUTES,nm+'.csv'),'w') as f:
+                for t,x,y,yw in ps: f.write("%.3f,%.4f,%.4f,%.4f\n"%(t,x,y,yw))
+            self._send(200,'saved "%s": %d pts, %.2f m'%(nm,len(ps),pathlen(ps)))
+        elif p=='/routes':
+            fs=sorted(f[:-4] for f in os.listdir(ROUTES) if f.endswith('.csv'))
+            self._send(200,json.dumps(fs),'application/json')
+        elif p=='/run':
+            nm=q.get('name',[''])[0]; md=q.get('mode',['full'])[0]
+            if state['mode']=='replay': self._send(409,'busy'); return
+            if not load(nm): self._send(404,'no route'); return
+            threading.Thread(target=run_route,args=(nm,md),daemon=True).start()
+            self._send(200,'running '+nm)
+        elif p=='/diag':
+            self._send(200,json.dumps(diag()),'application/json')
+        elif p=='/status':
+            with lock: ps=list(state['poses']); rec=state['rec']; nm=state['name']; md=state['mode']; rm=state['runmsg']
+            ok=(node.ox is not None) and (time.time()-node.ot<2.0)
+            self._send(200,json.dumps({'rec':rec,'name':nm,'count':len(ps),
+                       'dist':round(pathlen(ps),2),'odom':ok,'mode':md,'msg':rm}),'application/json')
+        else:
+            self._send(404,'nope')
+
+def shutdown(*a):
+    state['abort']=True
+    try:
+        for _ in range(6): ser.write(b'M,0,0\n'); time.sleep(0.02)
+        ser.close()
+    except Exception: pass
+    os._exit(0)
+signal.signal(signal.SIGTERM,shutdown); signal.signal(signal.SIGINT,shutdown)
+print("webdrive+recorder+replay on :%d (speed 100, cap %d, RBAL %.2f, routes->%s)"%(PORT,MAX_PWM,RBAL,ROUTES),flush=True)
+ThreadingHTTPServer(('0.0.0.0',PORT),H).serve_forever()

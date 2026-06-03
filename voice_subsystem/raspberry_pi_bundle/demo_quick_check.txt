@@ -1,0 +1,4 @@
+What departments are in this hospital?
+Where is dr ahmed?
+medium
+stop

@@ -1,26 +1,34 @@
-# Build artifacts
-ros2_ws/build/
-ros2_ws/install/
-ros2_ws/log/
-__pycache__/
-*.pyc
-*.egg-info/
-
-# Map image files (too large for git)
-*.pgm
-*.png
-
-# Vosk model (download separately)
-vosk-model*/
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
+# ROS 2 build artifacts
+build/
+install/
+log/
 
 # Python
-*.egg
-dist/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+test_venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Large / regenerable binaries
+*.deb
+*.whl
+*.tar.gz
+*.tgz
+*.zip
+
+# Logs
+*.log
+
+# TTS scratch output
+*response_*.mp3
+
+# Nested vendor git metadata (kept as plain sources)
+**/.git/

@@ -1,0 +1,460 @@
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
+import serial
+import threading
+import time
+import math
+
+# ── Robot physical parameters ──
+WHEEL_BASE = 0.34        # meters between left and right wheels
+MAX_VEL = 0.20           # m/s — what the robot does at MAX_PWM
+MAX_PWM = 150            # absolute max PWM sent to ESP32
+MIN_PWM = 55             # motors stall below this — tested minimum
+RIGHT_SCALE = 0.82       # right motor runs FASTER — scale it down so the robot
+                         # drives straight. Matches webdrive RBAL=0.82, the
+                         # hand-verified teleop calibration the user trusts.
+
+# ── LiDAR safety zones (meters) ──
+# LiDAR is mounted BACKWARD (yaw=pi): laser angle 0 = robot rear, ±pi = robot front
+FRONT_STOP_DIST = 0.30   # hard stop — too close ahead
+FRONT_SLOW_DIST = 0.60   # reduce to 50% speed ahead
+REAR_STOP_DIST = 0.25    # hard stop — too close behind (for reverse)
+SIDE_SLOW_DIST = 0.25    # reduce speed when walls are close on sides
+
+# Arc definitions (radians from robot's perspective, mapped to laser frame)
+FRONT_ARC = 1.047        # ±60° forward  → laser angles near ±pi
+REAR_ARC = 0.785         # ±45° backward → laser angles near 0
+SIDE_ARC_MIN = 1.047     # side zone starts at 60° from front
+SIDE_ARC_MAX = 1.571     # side zone ends at 90° from front (pure sideways)
+
+# ── In-place rotation (PULSED, IMU-closed-loop) ──
+# The EKF fuses the MPU9255 gyro, so odom->base_link yaw tracks REAL rotation and
+# Nav2/AMCL SEE the heading change and stop commanding angular.z once it is reached.
+# But the loop that does so is slow (5 Hz controller + coarse AMCL + serial), so a
+# steady full-PWM pivot spins PAST the target before it can stop -> the robot circles.
+# So each pivot is driven as a brief breakaway KICK then short ON/OFF PULSES (see the
+# pulse constants below and _pivot_tick): the base rotates in small bounded steps with
+# coast gaps for the loop to catch up. Pivots drive the wheels in opposite directions
+# at a PWM floored well above the pivot stall, so each burst always breaks static
+# friction (a proportional path that floored to the 55-PWM straight-drive stall just
+# whined without rotating).
+TURN_V_MAX   = 0.03   # |linear.x| below this  -> treat as an in-place pivot
+# DEADBAND: when ~stationary, |angular.z| below this is IGNORED (hold still, M,0,0).
+# Live /cmd_vel_nav capture (2026-06-02) showed the controller SIGN-FLIPS angular.z
+# almost every 10 Hz cycle while chasing the jittery ~2 Hz AMCL (LiDAR scan-match)
+# heading, and the velocity_smoother turns those flips into a +-0.1..0.2 rad/s sawtooth
+# (occasionally ramping to its 0.6 clamp when the controller briefly commits one way).
+# That noise band was the SYMPTOM, not the cause: the controller sign-flipped because it
+# was chasing a jumpy 2 Hz AMCL heading. 2026-06-03 the real fix moved upstream — AMCL now
+# trusts the IMU for rotation (alpha1/alpha2 ~0 in nav2_params), so the heading reference is
+# stable and the controller no longer sign-flips. With the oscillation killed at the source
+# the gate no longer needs an aggressive deadband. LIVE 2026-06-03: with AMCL stable the
+# controller commands a CLEAN steady ~0.11 rad/s turn (no sign-flips), but that sat right at
+# a 0.12 deadband and got dropped -> the robot never turned. Lowered to 0.08 so the gentle
+# final-approach turns pass; safe now that the command is steady (no flip to amplify).
+# Only applies in-place (|v|<TURN_V_MAX).
+TURN_W_MIN   = 0.08   # |angular.z| at/above this -> a real (pulsed) turn request
+# A 4-wheel skid-steer in-place pivot scrubs all four tyres sideways, so its
+# breakaway static friction is HIGH. The validated webdrive spin used 150/110
+# (raw/scaled) and a hand pivot worked at 130/106; the base did NOT rotate at
+# 123/100. Nav2's RPP only asks for a gentle |w|~0.1 rad/s during rotate-to-
+# heading, which the old 120 floor + W_REF 1.0 mapped to ~123 -> below breakaway
+# -> the robot never turned -> Nav2 declared itself stuck and looped through
+# recovery (clear-costmap/backup/DriveOnHeading) forever. Fix: floor every pivot
+# into the proven 140-150 band and hit the ceiling by |w|=0.5 so even a soft
+# turn request still actually rotates the robot.
+TURN_PWM_MIN = 140    # raw PWM floor for a pivot (proven turn band starts ~140)
+TURN_PWM_MAX = 150    # raw PWM ceiling for a pivot (== MAX_PWM)
+TURN_W_REF   = 0.5    # |w| (rad/s) mapping to the MAX pulse duty (ON_MAX/OFF_MIN); RPP
+                      # rarely exceeds this. (Was the old PWM-scale ref; now the duty ref.)
+
+# A floored pivot has NO proportional softness: any |w|>=TURN_W_MIN drove the SAME
+# full-PWM spin, so the controller could not ask for a gentle turn (live capture: navW=0.10
+# and navW=0.25 both produced ~20 deg/s). Combined with a slow loop (controller 10 Hz +
+# AMCL ~2 Hz, jumping ±20 deg/update + serial latency), the base spun past the target,
+# the heading error flipped, it rotated back -> the robot rocked left/right forever.
+# Fix: PULSE the pivot AND scale the DUTY CYCLE with |w|. A short full-PWM breakaway KICK
+# from a standstill, then ON bursts (full PWM) separated by OFF coast gaps. Small |w| ->
+# short ON + long OFF (low average rotation, lots of settle time); large |w| -> long ON +
+# short OFF (fast). Every burst is full PWM so it always breaks the high static friction
+# of a 4-wheel in-place scrub; only the AVERAGE rate is modulated. The OFF gaps let the
+# controller + AMCL see the new heading before the next burst, so it settles on target.
+PIVOT_KICK_PWM      = 150   # PWM for the breakaway kick AND each ON pulse (== MAX_PWM)
+PIVOT_KICK_T        = 0.20  # initial continuous kick (s) to break friction from a stop
+PIVOT_KICK_COOLDOWN = 0.40  # only re-fire the kick if idle this long (friction re-set);
+                            # a quick dip through the deadband between reversals skips it
+PIVOT_PULSE_ON_MIN  = 0.06  # ON time (s) at the deadband edge  -> slowest avg rotation
+PIVOT_PULSE_ON_MAX  = 0.16  # ON time (s) at/above TURN_W_REF    -> fastest avg rotation
+PIVOT_PULSE_OFF_MIN = 0.12  # OFF coast (s) at/above TURN_W_REF  -> mostly driving
+PIVOT_PULSE_OFF_MAX = 0.24  # OFF coast (s) at the deadband edge -> mostly coasting
+
+# REVERSAL DWELL: the live 2026-06-03 capture showed the residual stutter is an ACTUATOR
+# limit cycle — a floored full-PWM pivot overshoots the target heading by ~8 deg, Nav2
+# correctly commands a reverse, that overshoots back, forever ("undoes the turn"). The cure
+# is to rate-limit ONLY direction REVERSALS: after a pivot in one direction ends, a pivot in
+# the OPPOSITE direction is held (M,0,0) for this long so the base stops and the controller
+# re-reads a SETTLED heading before it kicks back. A SAME-direction (sustained/committed)
+# turn is never blocked, so a real turn still goes immediately — this does NOT re-freeze the
+# base the way the old block-everything hold did. Over a few dwell cycles the overshoot
+# amplitude decays below the deadband and the base lands on the heading.
+PIVOT_SETTLE_HOLD   = 0.5   # s to suppress an OPPOSITE-direction pivot after one ends
+
+
+class DiffDriveBridge(Node):
+    def __init__(self):
+        super().__init__('safety_gate')
+        self.ser = None
+        try:
+            self.ser = serial.Serial('/dev/ttyESP32', 115200, timeout=0.05)
+            self.get_logger().info('ESP32 connected on /dev/ttyESP32')
+        except Exception as e:
+            self.get_logger().error(f'ESP32 not found: {e}')
+
+        # Safety state
+        self.front_blocked = False
+        self.front_slow = False
+        self.rear_blocked = False
+        self.side_slow = False
+        self.closest_front = float('inf')
+        self.closest_rear = float('inf')
+        self.closest_side = float('inf')
+
+        # Watchdog: stop motors if no cmd_vel for 0.5s
+        self.last_cmd_time = time.time()
+        self.watchdog_timer = self.create_timer(0.25, self._watchdog)
+
+        # Pulsed-pivot state. _pivot_w holds the latest in-place-turn command
+        # (0.0 == not pivoting); _pivot_since marks when the current pivot began
+        # (drives the kick + ON/OFF pulse phase); _pivot_cmd_time is the last time
+        # Nav2 asked to turn (a 0.3 s pivot-watchdog ends the pivot when requests
+        # stop). _pivot_phase is the last-logged phase so we log only on change.
+        # A dedicated 20 Hz timer runs the pulse so it keeps toggling between the
+        # 5 Hz /cmd_vel frames, which the ESP would otherwise latch as a steady turn.
+        self._pivot_w = 0.0
+        self._pivot_since = 0.0
+        self._pivot_cmd_time = 0.0
+        self._pivot_last_active = 0.0   # last time _pivot_tick drove a pivot — gates the
+                                        # re-kick so reversals don't re-break friction
+        self._pivot_hold_until = 0.0    # suppress an OPPOSITE-direction pivot until this time
+        self._pivot_last_dir = 0        # sign of the last pivot direction (+1 CCW / -1 CW);
+                                        # the reversal dwell only blocks the opposite sign
+        self._pivot_phase = ''
+        self.pivot_timer = self.create_timer(0.05, self._pivot_tick)
+
+        self.cmd_sub = self.create_subscription(Twist, '/cmd_vel', self._on_cmd, 10)
+        self.scan_sub = self.create_subscription(LaserScan, '/scan', self._on_scan, 10)
+
+        if self.ser:
+            self.drain_thread = threading.Thread(target=self._drain_serial, daemon=True)
+            self.drain_thread.start()
+
+        self.get_logger().info('safety_gate ready — proportional diff-drive with 360° safety')
+
+    # ── Utilities ─────────────────────────────────────────────────────────────
+
+    def _drain_serial(self):
+        """Drain ESP32 serial buffer to prevent buildup."""
+        while rclpy.ok():
+            try:
+                if self.ser and self.ser.in_waiting:
+                    self.ser.read(self.ser.in_waiting)
+                else:
+                    time.sleep(0.05)
+            except Exception:
+                time.sleep(0.1)
+
+    def _watchdog(self):
+        """Stop motors if no cmd_vel for 0.5s."""
+        if self.ser and (time.time() - self.last_cmd_time) > 0.5:
+            self.ser.write(b'M,0,0\n')
+            self._pivot_w = 0.0       # left the pivot — next one re-arms the kick
+            self._pivot_since = 0.0
+
+    def _pivot_tick(self):
+        """Drive an in-place pivot as a brief breakaway KICK then PROPORTIONAL ON/OFF
+        PULSES (20 Hz). The ON/OFF split scales with |w| so the AVERAGE rotation rate
+        tracks how hard Nav2 wants to turn, while every ON burst still uses full kick PWM
+        to re-break the high static friction of a 4-wheel in-place scrub. Pulsing + the
+        OFF coast gaps cap how far the base rotates between the controller / AMCL updates,
+        so it settles on the target heading instead of overshooting and rocking."""
+        if not self.ser or self._pivot_w == 0.0:
+            return
+        now = time.time()
+        self._pivot_last_active = now
+        # Pivot-watchdog: Nav2 stopped asking to turn -> end the pivot cleanly.
+        if now - self._pivot_cmd_time > 0.3:
+            self.ser.write(b'M,0,0\n')
+            self._pivot_last_dir = 1 if self._pivot_w > 0 else -1   # remember which way
+            self._pivot_w = 0.0
+            self._pivot_since = 0.0
+            self._pivot_phase = ''
+            self._pivot_hold_until = now + PIVOT_SETTLE_HOLD   # block only a REVERSE next
+            return
+        w = self._pivot_w
+        elapsed = now - self._pivot_since
+        if elapsed < PIVOT_KICK_T:
+            drive, phase = True, 'KICK'
+        else:
+            # Duty cycle proportional to |w|: small turn -> short ON / long OFF (gentle),
+            # hard turn -> long ON / short OFF (fast). Restores the proportional control
+            # the floored PWM destroyed, so a fine correction no longer slams a full pivot.
+            frac = min(1.0, abs(w) / TURN_W_REF)
+            on  = PIVOT_PULSE_ON_MIN  + (PIVOT_PULSE_ON_MAX  - PIVOT_PULSE_ON_MIN)  * frac
+            off = PIVOT_PULSE_OFF_MAX - (PIVOT_PULSE_OFF_MAX - PIVOT_PULSE_OFF_MIN) * frac
+            cycle = (elapsed - PIVOT_KICK_T) % (on + off)
+            drive = cycle < on
+            phase = 'pulse-ON' if drive else 'pulse-OFF'
+        if drive:
+            if w > 0:        # CCW / LEFT
+                cmd = self._send(-PIVOT_KICK_PWM, PIVOT_KICK_PWM)
+            else:            # CW / RIGHT
+                cmd = self._send(PIVOT_KICK_PWM, -PIVOT_KICK_PWM)
+        else:
+            self.ser.write(b'M,0,0\n')
+            cmd = 'M,0,0'
+        if self._pivot_phase != phase:
+            self.get_logger().info(f'TURN[{phase}] w={w:.2f} -> {cmd}')
+            self._pivot_phase = phase
+
+    def stop_motors(self, repeat=5):
+        """Force a hard stop. Sent repeatedly on shutdown because the ESP32
+        firmware watchdog is disabled — if this node dies mid-turn without it,
+        the last full-power command stays latched and the robot runs away."""
+        if not self.ser:
+            return
+        for _ in range(repeat):
+            try:
+                self.ser.write(b'M,0,0\n')
+                time.sleep(0.02)
+            except Exception:
+                break
+
+    def _send(self, pwm_l, pwm_r):
+        """Send motor command with right-motor compensation and deadzone."""
+        # Apply right motor compensation
+        pwm_r = int(pwm_r * RIGHT_SCALE)
+
+        # Deadzone: if commanded but too low, bump up or zero out
+        if 0 < abs(pwm_l) < MIN_PWM:
+            pwm_l = MIN_PWM * (1 if pwm_l > 0 else -1)
+        if 0 < abs(pwm_r) < MIN_PWM:
+            pwm_r = MIN_PWM * (1 if pwm_r > 0 else -1)
+
+        # Clamp
+        pwm_l = max(-MAX_PWM, min(MAX_PWM, pwm_l))
+        pwm_r = max(-MAX_PWM, min(MAX_PWM, pwm_r))
+
+        cmd = f'M,{pwm_l},{pwm_r}\n'
+        if self.ser:
+            self.ser.write(cmd.encode())
+        return cmd.strip()
+
+    def _vel_to_pwm(self, vel_ms):
+        """Convert m/s to raw PWM (before RIGHT_SCALE, before deadzone)."""
+        if abs(vel_ms) < 0.005:
+            return 0
+        return int((vel_ms / MAX_VEL) * MAX_PWM)
+
+    # ── LiDAR 360° safety scan ───────────────────────────────────────────────
+
+    def _on_scan(self, msg):
+        """Scan ALL directions for obstacles.
+        LiDAR mounted backward (yaw=pi):
+          robot front  = laser angle near ±pi
+          robot rear   = laser angle near 0
+          robot sides  = laser angle near ±pi/2
+        """
+        closest_front = float('inf')
+        closest_rear = float('inf')
+        closest_side = float('inf')
+        angle = msg.angle_min
+
+        for r in msg.ranges:
+            if msg.range_min < r < msg.range_max:
+                # How far is this angle from ±pi (robot front)?
+                dist_from_front = math.pi - abs(angle)
+                # How far is this angle from 0 (robot rear)?
+                dist_from_rear = abs(angle)
+
+                # Front arc: within FRONT_ARC of ±pi
+                if dist_from_front <= FRONT_ARC:
+                    if r < closest_front:
+                        closest_front = r
+
+                # Rear arc: within REAR_ARC of 0
+                if dist_from_rear <= REAR_ARC:
+                    if r < closest_rear:
+                        closest_rear = r
+
+                # Side arcs: between 60° and 90° from front on each side
+                if SIDE_ARC_MIN <= dist_from_front <= SIDE_ARC_MAX:
+                    if r < closest_side:
+                        closest_side = r
+
+            angle += msg.angle_increment
+
+        self.closest_front = closest_front
+        self.closest_rear = closest_rear
+        self.closest_side = closest_side
+
+        # Front safety
+        self.front_blocked = closest_front < FRONT_STOP_DIST
+        self.front_slow = FRONT_STOP_DIST <= closest_front < FRONT_SLOW_DIST
+
+        # Rear safety
+        self.rear_blocked = closest_rear < REAR_STOP_DIST
+
+        # Side safety (slow down in narrow spaces)
+        self.side_slow = closest_side < SIDE_SLOW_DIST
+
+        # Log transitions only (not every scan)
+        prev_fb = getattr(self, '_prev_front_blocked', False)
+        prev_rb = getattr(self, '_prev_rear_blocked', False)
+        if self.front_blocked and not prev_fb:
+            self.get_logger().warn(f'FRONT BLOCKED at {closest_front:.2f}m — stopping forward')
+        elif not self.front_blocked and prev_fb:
+            self.get_logger().info('Front clear — resuming')
+        if self.rear_blocked and not prev_rb:
+            self.get_logger().warn(f'REAR BLOCKED at {closest_rear:.2f}m — stopping reverse')
+        elif not self.rear_blocked and prev_rb:
+            self.get_logger().info('Rear clear — resuming')
+        self._prev_front_blocked = self.front_blocked
+        self._prev_rear_blocked = self.rear_blocked
+
+    # ── Velocity command handler ──────────────────────────────────────────────
+
+    def _on_cmd(self, msg):
+        if not self.ser:
+            return
+        self.last_cmd_time = time.time()
+
+        try:
+            v = msg.linear.x    # m/s forward(+) / backward(-)
+            # Standard ROS convention: positive angular.z = LEFT (CCW),
+            # negative = RIGHT (CW). The earlier w-negation was a mis-fix made
+            # during the demo-square phase (a 4-turn square hides direction);
+            # a single right_test turn proved it inverted, so it's removed.
+            w = msg.angular.z   # rad/s left(+) / right(-)
+
+            # ── Near-stationary DEADBAND: ignore micro-commands (hold still) ──
+            # Barely translating AND only a tiny turn asked: do nothing (M,0,0). A floored
+            # pivot can only overshoot such a fine correction, and driving the near-zero
+            # velocities just whines at the deadzone. Dropping sub-deadband corrections is
+            # what stops the live-captured L/R micro-hunting around the target heading.
+            if abs(v) < TURN_V_MAX and abs(w) < TURN_W_MIN:
+                if self._pivot_w != 0.0:    # a pivot just ended -> arm the reversal dwell
+                    self._pivot_last_dir = 1 if self._pivot_w > 0 else -1
+                    self._pivot_hold_until = time.time() + PIVOT_SETTLE_HOLD
+                self.ser.write(b'M,0,0\n')
+                self._pivot_w = 0.0
+                self._pivot_since = 0.0
+                return
+
+            # ── In-place rotation: record intent; _pivot_tick pulses the motors ──
+            # We do NOT drive the wheels here. /cmd_vel arrives at only ~10 Hz and the ESP
+            # latches the last frame, so driving here would hold a steady turn — the
+            # sustained, overshooting pivot we are replacing. Instead we just record the
+            # turn; the 20 Hz _pivot_tick reads _pivot_w and emits the KICK-then-
+            # proportional-ON/OFF-pulse pattern so the base rotates in small bounded steps.
+            if abs(v) < TURN_V_MAX and abs(w) >= TURN_W_MIN:
+                now = time.time()
+                # REVERSAL DWELL: a pivot ended recently and THIS command is the OPPOSITE
+                # direction (the overshoot "undo") -> hold still until the base settles and
+                # the controller re-reads a stable heading. A SAME-direction (committed)
+                # turn falls through and proceeds immediately, so real turns are never frozen.
+                cur_dir = 1 if w > 0 else -1
+                if (self._pivot_w == 0.0 and now < self._pivot_hold_until
+                        and self._pivot_last_dir != 0 and cur_dir != self._pivot_last_dir):
+                    self.ser.write(b'M,0,0\n')
+                    return
+                if self._pivot_w == 0.0:
+                    # Entering a pivot. Only re-arm the breakaway KICK if the base has
+                    # actually been idle long enough for static friction to re-set; a
+                    # quick dip through the deadband between reversals should NOT re-kick
+                    # (re-kicking on every reversal would itself rock the base).
+                    if now - self._pivot_last_active > PIVOT_KICK_COOLDOWN:
+                        self._pivot_since = now                 # cold -> KICK then pulse
+                    else:
+                        self._pivot_since = now - PIVOT_KICK_T  # warm -> skip kick, pulse
+                self._pivot_w = w
+                self._pivot_cmd_time = now
+                return
+
+            # Past the pivot branch => real driving (|v| >= TURN_V_MAX): clear the pivot
+            # so _pivot_tick stops pulsing and the next turn re-arms cleanly.
+            self._pivot_w = 0.0
+            self._pivot_since = 0.0
+
+            # ── Safety overrides ──
+
+            # Front blocked: stop forward, allow backward and turning
+            if self.front_blocked and v > 0:
+                v = 0.0
+                # If also not turning, just stop
+                if abs(w) < 0.1:
+                    self.ser.write(b'M,0,0\n')
+                    return
+
+            # Rear blocked: stop backward, allow forward and turning
+            if self.rear_blocked and v < 0:
+                v = 0.0
+                if abs(w) < 0.1:
+                    self.ser.write(b'M,0,0\n')
+                    return
+
+            # Front slow zone: reduce forward speed to 50%
+            if self.front_slow and v > 0:
+                v *= 0.5
+                w *= 0.7  # slightly reduce turn speed too
+
+            # Side slow zone (narrow hallway): reduce overall speed to 60%
+            if self.side_slow:
+                v *= 0.6
+                w *= 0.6
+
+            # ── Differential drive kinematics ──
+            # v_left  = v - w * (wheelbase / 2)
+            # v_right = v + w * (wheelbase / 2)
+            v_left = v - w * (WHEEL_BASE / 2.0)
+            v_right = v + w * (WHEEL_BASE / 2.0)
+
+            # Convert to PWM (raw, before RIGHT_SCALE)
+            pwm_l = self._vel_to_pwm(v_left)
+            pwm_r = self._vel_to_pwm(v_right)
+
+            # Send with compensation and deadzone
+            cmd = self._send(pwm_l, pwm_r)
+
+            self.get_logger().info(
+                f'v={v:.2f} w={w:.2f} L={v_left:.2f} R={v_right:.2f} '
+                f'F={self.closest_front:.2f} R={self.closest_rear:.2f} S={self.closest_side:.2f} '
+                f'-> {cmd}'
+            )
+        except Exception as e:
+            self.get_logger().error(f'cmd error: {e}')
+
+
+def main():
+    rclpy.init()
+    node = DiffDriveBridge()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # Ctrl-C or an external SIGTERM (e.g. `ros2 launch` teardown) — both are
+        # normal ways to stop the gate, so exit quietly. The finally below still
+        # runs the hard-stop, so the wheels are never left latched.
+        pass
+    finally:
+        # Force a stop on the way out so a Ctrl-C mid-turn can't leave the
+        # ESP32 latched on a full-power command (the runaway we hit).
+        node.stop_motors()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
